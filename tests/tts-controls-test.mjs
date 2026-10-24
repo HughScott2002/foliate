@@ -54,6 +54,10 @@ deletePack(pack.id)
 
 const builder = Gtk.Builder.new_from_string('<interface><object class="FoliateNavBar" id="nav"/></interface>', -1)
 const nav = builder.get_object('nav')
+// the popover needs a realized toplevel to have a surface
+const navWindow = new (await import('gi://Adw?version=1')).default.Window({ width_request: 600 })
+navWindow.content = nav
+navWindow.present()
 nav.setTTSType('tts')
 const buttons = [...descendants(nav)].filter(w => w instanceof Gtk.Button)
 const play = buttons.find(w => ['Pause narration', 'Resume narration'].includes(w.tooltip_text))
@@ -68,6 +72,12 @@ check(nav.tts_box.state === 'paused' && nav.shouldStayVisible,
 stop.emit('clicked')
 check(nav.tts_box.state === 'stopped' && !nav.shouldStayVisible,
     'inline stop must release navbar')
+// a modal dialog presented from a control inside the narration popover
+// must not fight the popover's grab: hideNarration closes it first
+nav._tts_popover.popup()
+check(nav._tts_popover.visible, 'narration popover did not open')
+nav.hideNarration()
+check(!nav._tts_popover.visible, 'hideNarration must close the narration popover')
 nav.setTTSType('media-overlay')
 nav.media_overlay_box.state = 'playing'
 check(nav.shouldStayVisible && play.get_visible(), 'media-overlay controls must stay visible too')
@@ -77,4 +87,5 @@ stop.emit('clicked')
 check(nav.media_overlay_box.state === 'stopped', 'persistent stop must target media overlay')
 box.kill()
 nav.tts_box.kill()
+navWindow.destroy()
 print('Narration backend and persistent controls tests passed')

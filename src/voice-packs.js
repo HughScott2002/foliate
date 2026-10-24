@@ -75,6 +75,22 @@ export const pickPackForLanguage = language => {
     return getPacks().find(pack => pack.languages.includes(primary))
 }
 
+// Which pack to narrate a book with, in priority order:
+//   1. the pack the user saved for this book
+//   2. the installed default pack (supertonic)
+//   3. an installed pack that supports the book's language
+//   4. the default pack, even if not installed (drives a download prompt)
+//   5. any pack (installed or not) that supports the book's language
+export const choosePack = ({ saved = null, language = 'en' } = {}) => {
+    const primary = (language || 'en').toLowerCase().split(/[-_]/)[0]
+    const installed = getInstalledPacks()
+    return getPacks().find(pack => pack.id === saved)
+        ?? installed.find(pack => pack.default)
+        ?? installed.find(pack => pack.languages.includes(primary))
+        ?? getPacks().find(pack => pack.default)
+        ?? pickPackForLanguage(primary)
+}
+
 export const packDir = id => {
     if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) throw new Error('Invalid voice pack ID')
     return GLib.build_filenamev([voicesDir(), id])

@@ -22,7 +22,7 @@ import { formatLanguageMap, formatAuthors, makeBookInfoWindow } from './book-inf
 import { themes, invertTheme, themeCssProvider } from './themes.js'
 import { dataStore, BookData } from './data.js'
 import { VoiceManagerDialog } from './voice-manager.js'
-import { getPacks, getInstalledPacks, pickPackForLanguage } from './voice-packs.js'
+import { choosePack } from './voice-packs.js'
 
 // for use in the WebView
 const uiText = {
@@ -864,16 +864,19 @@ export const BookViewer = GObject.registerClass({
         const tts = this._navbar.tts_box
         tts.language = (Array.isArray(language) ? language[0] : language) || 'en'
         const primary = tts.language.toLowerCase().split(/[-_]/)[0]
-        const saved = this.#data?.storage.get('tts-voice-pack')
-        tts.setPack(getPacks().find(pack => pack.id === saved)
-            ?? getInstalledPacks().find(pack => pack.languages.includes(primary))
-            ?? pickPackForLanguage(primary)
-            ?? getPacks().find(pack => pack.default))
+        tts.setPack(choosePack({
+            saved: this.#data?.storage.get('tts-voice-pack'),
+            language: primary,
+        }))
     }
     #showVoices(startAfterSelection = false) {
         if (this.#voiceManager) return
         const tts = this._navbar.tts_box
         tts.stop()
+        // the control that opened this lives inside the narration popover;
+        // leaving it open would hold a GTK grab and the dialog would not
+        // take input
+        this._navbar.hideNarration()
         const dialog = new VoiceManagerDialog({
             language: tts.language.split(/[-_]/)[0], selected: tts.pack?.id,
         })

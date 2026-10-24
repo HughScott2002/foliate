@@ -250,6 +250,11 @@ GObject.registerClass({
             .then(text => this.emit('go-to-cfi', text))
             .catch(e => console.warn(e))
     }
+    // Close the narration popover, e.g. before presenting a modal dialog
+    // from a control inside it (an open popover holds a GTK grab).
+    hideNarration() {
+        this._tts_popover.popdown()
+    }
     showLocation() {
         this.emit('opened')
         this._location_button.popup()

@@ -68,7 +68,8 @@ const nav = viewer._navbar
 const tts = nav.tts_box
 const web = viewer._view.webView
 await until(() => tts.pack, 'book never became ready')
-check(tts.pack.id === 'kokoro', 'English book did not select Kokoro')
+check(tts.pack.id === 'supertonic',
+    `English book did not select the default pack (got ${tts.pack.id})`)
 let marks = 0
 tts.connect('highlight', () => { marks++ })
 tts.start()
