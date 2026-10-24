@@ -94,7 +94,10 @@ const headerPath = GLib.build_filenamev([fakeDir, 'header.bin'])
     out.write_bytes(new GLib.Bytes(header), null)
     out.close(null)
 }
-const expectedDuration = 32036 / 32000
+// duration the parser must report: the data chunk (32000 bytes) over the
+// byte rate — the RIFF size (44 + 32000 - 8) carries header bias and is
+// no longer used
+const expectedDuration = 32000 / 32000
 
 // fake engine: dumps argv one arg per line, writes the known wav at the
 // --output-filename path, counts invocations
@@ -129,7 +132,25 @@ echo 'engine exploded' >&2
 exit 3
 `)
 
-const [kokoroPack, supertonicPack, piperPack] = getPacks()
+// fake engine that writes a complete wav and THEN fails: the crash path
+// must leave neither the .part staging file nor a cache-visible wav
+const crashesAfterWrite = writeScript('fake-crash-after-write.sh', `#!/bin/sh
+dir=$(dirname "$0")
+for arg; do
+    case "$arg" in
+        --output-filename=*) wav="\${arg#--output-filename=}" ;;
+    esac
+done
+cat "${headerPath}" > "$wav"
+head -c 32000 /dev/zero >> "$wav"
+echo 'wrote it, then died' >&2
+exit 1
+`)
+
+const packs = getPacks()
+const kokoroPack = packs.find(p => p.id === 'kokoro')
+const supertonicPack = packs.find(p => p.id === 'supertonic')
+const piperPack = packs.find(p => p.id === 'piper')
 
 // --- argv construction is a pure function of the pack ---
 
@@ -231,6 +252,8 @@ assert(args[args.length - 1] === 'Hello world.',
 assert(args.filter(arg => !arg.startsWith('--')).length === 1,
     'exactly one positional text arg')
 assert(args.some(arg => arg === '--sid=23'), 'pack sid passes through')
+assert(args.some(arg => arg === `--output-filename=${first.wavPath}.part`),
+    'the engine stages at <hash>.wav.part, not the cache-visible path')
 
 // hit: same inputs resolve from the cache without running the engine
 const second = await tts.synth('Hello world.', kokoroPack)
@@ -309,6 +332,27 @@ try {
     assert(/3/.test(error.message),
         `nonzero exit status reaches the error message (got: ${error.message})`)
 }
+
+// --- a crash AFTER the wav is written must not look like a cache hit ---
+
+GLib.setenv('FOLIATE_TTS_CMD', crashesAfterWrite, true)
+try {
+    await tts.synth('Crash after write.', kokoroPack)
+    failures++
+    printerr('FAIL: an engine that crashes after writing should reject')
+} catch (error) {
+    assert(/synthesis failed/.test(error.message) && /died/.test(error.message),
+        `crash-after-write rejects with the engine noise (got: ${error.message})`)
+}
+const crashPart = argsLast()
+    .find(arg => arg.startsWith('--output-filename='))
+    ?.slice('--output-filename='.length)
+assert(crashPart, 'the crashed engine was invoked with an output path')
+assert(!GLib.file_test(crashPart, GLib.FileTest.EXISTS),
+    'a crashed engine leaves no .part staging file behind')
+assert(!GLib.file_test(crashPart.replace(/\.part$/, ''), GLib.FileTest.EXISTS),
+    'a crashed engine leaves no cache-visible wav behind')
+GLib.setenv('FOLIATE_TTS_CMD', writer, true)
 
 // --- one live synth at a time, killed on cancel and on stop ---
 
@@ -400,7 +444,7 @@ const report = line => GLib.file_set_contents(
 try {
     const { getPacks, verifyPack } = await import('${srcUri('voice-packs.js')}')
     const { LocalTTS } = await import('${srcUri('local-tts.js')}')
-    const pack = getPacks()[0]
+    const pack = getPacks().find(p => p.id === 'kokoro')
     if (!GLib.find_program_in_path('sherpa-onnx-offline-tts'))
         report('MANUAL-SKIPPED: real-engine smoke — sherpa-onnx-offline-tts not in PATH')
     else if (!verifyPack(pack))
@@ -413,7 +457,7 @@ try {
         if (size <= 44 || !(duration > 0))
             throw new Error('bad smoke output: size=' + size +
                 ' duration=' + duration)
-        report('SMOKE-OK duration=' + duration)
+        report('SMOKE-OK ' + wavPath + ' duration=' + duration)
     }
 } catch (error) {
     report('SMOKE-FAIL: ' + error.message)
@@ -431,16 +475,37 @@ exit(0)
     GLib.setenv('XDG_DATA_HOME', tmp, true) // the child has its env copy
     GLib.setenv('FOLIATE_TTS_CMD', writer, true)
     GLib.unsetenv('SMOKE_OUT')
-    let smokeOk = true
     try {
-        proc.wait_check(null)
-    } catch {
-        smokeOk = false
+        let smokeOk = true
+        try {
+            proc.wait_check(null)
+        } catch {
+            smokeOk = false
+        }
+        const smoke = readTextOr(smokeOut,
+            'SMOKE-FAIL: no smoke report written')
+        print(smoke.trim())
+        // the smoke wav is a real engine artifact: removed here even when
+        // the assertions below fail; a child crash leaves nothing at the
+        // cache-visible path (the .part sweep covers its staging file)
+        const smokeWav = smoke.startsWith('SMOKE-OK ')
+            ? smoke.trim().split(' ')[1] : null
+        if (smokeWav) {
+            try {
+                Gio.File.new_for_path(smokeWav).delete(null)
+            } catch { /* already gone */ }
+        }
+        assert(smokeOk && /SMOKE-OK |MANUAL-SKIPPED:/.test(smoke),
+            `real-engine smoke ran or was skipped (got: ${smoke.trim()})`)
+    } finally {
+        // the child's whole default cache dir is inside the temp XDG tree:
+        // sweep it whatever happened
+        try {
+            Gio.File.new_for_path(
+                GLib.build_filenamev([tmp, 'foliate', 'tts-wav']))
+                .delete(null)
+        } catch { /* nothing to sweep */ }
     }
-    const smoke = readTextOr(smokeOut, 'SMOKE-FAIL: no smoke report written')
-    print(smoke.trim())
-    assert(smokeOk && /SMOKE-OK|MANUAL-SKIPPED:/.test(smoke),
-        `real-engine smoke ran or was skipped (got: ${smoke.trim()})`)
 }
 
 // wait for the killed fake engines' SIGCHLD teardown before checking state

@@ -77,9 +77,10 @@ const reap = proc => {
     return waiting
 }
 
-// duration in seconds from the RIFF header: riff size (file size - 8,
-// bytes 4-8 little-endian) over the byte rate (sampleRate * channels *
-// bits / 8)
+// duration in seconds from the RIFF header: data chunk size (bytes 40-44,
+// little-endian) over the byte rate (sampleRate * channels * bits / 8) —
+// exact for canonical and extra-chunk RIFFs, unlike the RIFF size at
+// bytes 4-8 which carries the 44-byte header bias
 const parseWavDuration = path => {
     const stream = Gio.File.new_for_path(path).read(null)
     try {
@@ -93,18 +94,25 @@ const parseWavDuration = path => {
             view.getUint16(34, true) / 8
         if (!byteRate)
             throw new Error(`invalid wav header: ${path}`)
-        return view.getUint32(4, true) / byteRate
+        return view.getUint32(40, true) / byteRate
     } finally {
         stream.close(null)
     }
 }
 
 // the cache key covers everything the audio depends on: the text, the
-// pack, the voice id, and the language. NUL separators keep fields from
-// blurring into each other ('ab'+'c' must not hash as 'a'+'bc').
+// pack, the voice id, and — only where the engine takes it — the language.
+// NUL separators keep fields from blurring into each other ('ab'+'c' must
+// not hash as 'a'+'bc').
 const cacheKey = (text, id, sid, lang) => GLib.compute_checksum_for_bytes(
     GLib.ChecksumType.SHA256, new GLib.Bytes(
-        new TextEncoder().encode(`${text}\0${id}\0${sid}\0${lang}`)))
+        new TextEncoder().encode(
+            `${text}\0${id}\0${sid}${lang ? `\0${lang}` : ''}`)))
+
+// move a completed file into place: same-directory rename, so the engine
+// never leaves a partial file at the cache-visible path
+const moveFile = (from, to) => Gio.File.new_for_path(from)
+    .move(Gio.File.new_for_path(to), Gio.FileCopyFlags.OVERWRITE, null, null)
 
 // CLI flag templates, keyed by pack id: engine-specific flags, then the
 // voice id, thread count, output file, and debug flag shared by all packs,
@@ -142,12 +150,13 @@ const ENGINE_FLAGS = {
 
 // Pure argv builder: flags reference packDir(pack.id) paths, resolved to
 // absolute. lang is only used by supertonic (default 'en').
-export const buildEngineArgs = (pack, { wavPath, lang } = {}) => {
+export const buildEngineArgs = (pack, { wavPath, lang, sid } = {}) => {
     const build = ENGINE_FLAGS[pack?.id]
     if (!build)
         throw new Error(`unknown pack id: ${pack?.id}`)
+    const sidUsed = sid ?? pack.sid
     return [
-        ...build(packDir(pack.id), pack.sid, lang ?? 'en'),
+        ...build(packDir(pack.id), sidUsed, lang ?? 'en'),
         `--num-threads=${NUM_THREADS}`,
         `--output-filename=${wavPath}`,
         '--debug=0',
@@ -157,7 +166,7 @@ export const buildEngineArgs = (pack, { wavPath, lang } = {}) => {
 export class LocalTTS {
     #cacheDir
     #proc = null
-    #stopped = false
+    #stoppedProc = null
 
     constructor({ cacheDir } = {}) {
         this.#cacheDir = cacheDir ?? GLib.build_filenamev(
@@ -169,12 +178,15 @@ export class LocalTTS {
     // (Task 4 builds the playback queue on top); cache hits return
     // immediately since they spawn nothing.
     async synth(text, pack, { lang, sid, cancellable = null } = {}) {
-        // effective overrides: the sid option stands in for pack.sid, the
-        // lang option only reaches the engine on supertonic packs
+        // effective overrides: the sid option stands in for pack.sid; the
+        // lang option only reaches the engine on supertonic packs, so it
+        // keys the cache only there and a UI language switch cannot fork
+        // kokoro/piper cache entries for identical audio
         const langUsed = lang ?? 'en'
+        const keyLang = pack.id === 'supertonic' ? langUsed : null
         const sidUsed = sid ?? pack.sid
         const wavPath = GLib.build_filenamev([this.#cacheDir, `${cacheKey(
-            text, pack.id, sidUsed, langUsed)}.wav`])
+            text, pack.id, sidUsed, keyLang)}.wav`])
         if (GLib.file_test(wavPath, GLib.FileTest.IS_REGULAR))
             return { wavPath, duration: parseWavDuration(wavPath) }
         if (this.#proc)
@@ -183,15 +195,20 @@ export class LocalTTS {
         const program = GLib.find_program_in_path(cmd)
         if (!program)
             throw new Error(`TTS engine not found: ${cmd}`)
-        const argv = [program, ...buildEngineArgs(
-            sid == null ? pack : { ...pack, sid: sidUsed },
-            { wavPath, lang: langUsed }), text]
-        GLib.mkdir_with_parents(this.#cacheDir, parseInt('0755', 8))
+        // stage the output at <hash>.wav.part: the engine writes the file
+        // incrementally, so a killed or crashed run would otherwise leave
+        // a partial wav at the cache-visible path and every later call
+        // would treat it as a cache hit (playing silence). The .part file
+        // is renamed onto the final path only after a clean exit.
+        const partPath = `${wavPath}.part`
+        const partFile = Gio.File.new_for_path(partPath)
+        const argv = [program, ...buildEngineArgs(pack,
+            { wavPath: partPath, sid: sidUsed, lang: langUsed }), text]
+        GLib.mkdir_with_parents(this.#cacheDir, 0o755)
         const proc = Gio.Subprocess.new(argv,
             Gio.SubprocessFlags.STDOUT_SILENCE |
             Gio.SubprocessFlags.STDERR_PIPE)
         this.#proc = proc
-        this.#stopped = false
         try {
             const stderrPromise = drain(proc.get_stderr_pipe())
             try {
@@ -199,20 +216,27 @@ export class LocalTTS {
                     cancellable)
             } catch (error) {
                 // cancelled or died: force-exit and reap before reporting,
-                // so nothing is left running behind the rejected promise
+                // so nothing is left running behind the rejected promise,
+                // and no partial .part file survives for later calls to
+                // mistake for a cache hit
                 proc.force_exit()
                 await reap(proc)
                 const stderr = await stderrPromise
-                if (this.#stopped)
+                try { partFile.delete(null) } catch { /* nothing staged */ }
+                if (this.#stoppedProc === proc)
                     throw new Error('synthesis stopped')
                 throw new Error(['synthesis failed', error.message,
                     stderr].filter(Boolean).join(': '))
             }
             // success still drains stderr so the pipe fd is closed
             const stderr = await stderrPromise
-            if (!GLib.file_test(wavPath, GLib.FileTest.IS_REGULAR))
+            if (!GLib.file_test(partPath, GLib.FileTest.IS_REGULAR)) {
+                try { partFile.delete(null) } catch { /* nothing staged */ }
                 throw new Error(['engine wrote no output', program, stderr]
                     .filter(Boolean).join(': '))
+            }
+            // clean exit: publish the wav at its cache-visible path
+            moveFile(partPath, wavPath)
             return { wavPath, duration: parseWavDuration(wavPath) }
         } finally {
             if (this.#proc === proc) this.#proc = null
@@ -221,10 +245,13 @@ export class LocalTTS {
 
     // Force-exit any live synth subprocess and wait for it to be reaped,
     // so a stopped synthesis never leaves an orphaned engine behind.
+    // The stopped process is tracked (not a boolean flag) so a later
+    // synth started after stopAll() resolves can never be misreported
+    // as stopped by the still-unwinding previous frame.
     async stopAll() {
         const proc = this.#proc
         if (!proc) return
-        this.#stopped = true
+        this.#stoppedProc = proc
         proc.force_exit()
         await reap(proc)
         if (this.#proc === proc) this.#proc = null
