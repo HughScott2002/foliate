@@ -1,6 +1,4 @@
 import Gio from 'gi://Gio'
-import Gst from 'gi://Gst'
-import GstPlay from 'gi://GstPlay'
 
 // Sentence-level playback queue on top of a LocalTTS instance: synthesize
 // ahead of playback (at most two sentences beyond the one being played,
@@ -19,26 +17,41 @@ const clampRate = rate => Math.min(RATE_MAX, Math.max(RATE_MIN, rate))
 // treats it as an ordinary stop, not a failure.
 const STOPPED = 'playback stopped'
 
-// GStreamer must be initialized once per process before any pipeline is
-// built; another module may have done it already.
-const ensureGst = () => {
-    if (!Gst.is_initialized()) Gst.init([])
+// GStreamer typelibs load on first use, not on import: a runtime without
+// the GstPlay typelib (GStreamer Bad Plugins) fails the individual play
+// with a clean error instead of breaking the module — and consumers that
+// inject their own playWav never load it at all.
+let gstModules = null
+const loadGst = async () => {
+    if (!gstModules) {
+        const [gst, gstPlay] = await Promise.all([
+            import('gi://Gst'),
+            import('gi://GstPlay'),
+        ])
+        gstModules = { Gst: gst.default, GstPlay: gstPlay.default }
+    }
+    return gstModules
 }
 
-// Default playback backend: one GstPlay pipeline per sentence. The
-// returned promise resolves at end-of-stream; pause/resume/stop and
-// setRate hang off the promise itself as the small boundary the queue
-// drives the active pipeline through, and stop() rejects it with the
-// stable stop error above. (The GstPlay typelib ships in GStreamer Bad
-// Plugins; playbin would be the fallback if a runtime lacks it.)
-const gstreamerPlayWav = (wavPath, { rate } = {}) => {
-    ensureGst()
+// Default playback backend: one GstPlay pipeline per sentence. Returns a
+// session whose `done` promise resolves at end-of-stream; pause/resume/
+// stop and setRate are hooks on the session object, and stop() rejects
+// `done` with the stable stop error above.
+const gstreamerPlayWav = async (wavPath, { rate } = {}) => {
+    const { Gst, GstPlay } = await loadGst()
+    // init once per process; another module may have done it already
+    if (!Gst.is_initialized()) Gst.init([])
     const play = new GstPlay.Play()
     play.set_uri(Gio.File.new_for_path(wavPath).get_uri())
-    // GstPlay reports its own lifecycle through a signal adapter
+    // GstPlay reports its own lifecycle through a signal adapter; the
+    // adapter must stay alive for the whole session (it owns the bus
+    // watch that delivers end-of-stream), so it is captured on the
+    // returned session object, which the queue holds until the sentence
+    // finishes — a collected adapter would silently drop the watch and
+    // the session would never settle
     const adapter = GstPlay.PlaySignalAdapter.new(play)
     let stopPipeline = null
-    const promise = new Promise((resolve, reject) => {
+    const done = new Promise((resolve, reject) => {
         adapter.connect('end-of-stream', () => resolve())
         adapter.connect('error', (_adapter, error, details) =>
             reject(new Error(['playback failed', error?.message,
@@ -48,13 +61,19 @@ const gstreamerPlayWav = (wavPath, { rate } = {}) => {
             reject(new Error(STOPPED))
         }
     })
+    // the rate is set before play(): setting it afterwards forces a
+    // flush seek while prerolling. `|| 1` keeps 0 and undefined from
+    // reaching set_rate, which aborts on a zero rate.
+    play.set_rate(rate || 1)
     play.play()
-    if (rate !== 1) play.set_rate(rate)
-    promise.pause = () => play.pause()
-    promise.resume = () => play.play()
-    promise.stop = () => stopPipeline()
-    promise.setRate = rate => play.set_rate(rate)
-    return promise
+    return {
+        done,
+        adapter,
+        pause: () => play.pause(),
+        resume: () => play.play(),
+        stop: () => stopPipeline(),
+        setRate: rate => play.set_rate(rate || 1),
+    }
 }
 
 export class LocalTTSPlayer {
@@ -80,17 +99,31 @@ export class LocalTTSPlayer {
     // fails. Resolves after the terminal callback, so callers may await
     // the whole run.
     async play(sentences, {
-        pack, lang, voice, rate = 1, onMark, onEnd, onError,
+        pack, lang, voice, rate, onMark, onEnd, onError,
     } = {}) {
-        if (this.#run)
-            throw new Error('a playback is already in progress')
+        // a stopped or failed run may still be unwinding (its teardown
+        // reaps the engine before reporting): wait for it instead of
+        // rejecting, because stop() followed by play() in the same tick
+        // is the restart flow. A genuinely live run still rejects.
+        while (this.#run) {
+            if (!this.#run.dead)
+                throw new Error('a playback is already in progress')
+            await this.#run.done
+        }
+        // this run owns the state now: the rate option overrides only
+        // when explicitly passed, and a fresh run is never paused — a
+        // pause() with nothing playing is not remembered into it (the
+        // UI would show playing with no audio sounding)
+        this.#rate = clampRate(rate ?? this.#rate)
+        this.#paused = false
+        let releaseRun
         const run = {
             session: null,
             dead: false,
             cancellable: new Gio.Cancellable(),
+            done: new Promise(resolve => { releaseRun = resolve }),
         }
         this.#run = run
-        this.#rate = clampRate(rate)
 
         // a failed synth halts the whole queue: later chain entries must
         // see it before they call the engine again, so it is tracked on
@@ -147,15 +180,26 @@ export class LocalTTSPlayer {
                     throw error
                 }
                 onMark?.(sentences[i]?.index ?? i)
+                // a stop issued from inside the mark callback must stop
+                // the mark's own sentence from playing too
+                if (run.dead) break
                 playIndex = i
                 kick()
-                const session = this.#makeSession(result.wavPath, {
+                const session = await this.#makeSession(result.wavPath, {
                     rate: this.#rate,
                 })
                 run.session = session
+                if (run.dead) {
+                    // a stop landed while the factory was awaiting:
+                    // stop the fresh session before it can make a
+                    // sound and unwind as a stop
+                    session.stop?.()
+                    await session.done.catch(() => {})
+                    break
+                }
                 if (this.#paused) session.pause?.()
                 try {
-                    await session
+                    await session.done
                 } catch (error) {
                     if (run.dead) break // stopped, not failed
                     run.dead = true
@@ -176,13 +220,15 @@ export class LocalTTSPlayer {
                 await this.#tts.stopAll()
             } catch { /* nothing left to reap */ }
             if (this.#run === run) this.#run = null
+            releaseRun()
             if (failure) onError?.(failure)
             else onEnd?.(null)
         }
     }
 
-    // Hold the current position; a session created while paused starts
-    // paused. (GStreamer holds the position across pause/resume.)
+    // Hold the current position; a session created mid-run while paused
+    // (in the gap between two sentences) starts paused. (GStreamer holds
+    // the position across pause/resume.)
     pause() {
         this.#paused = true
         this.#run?.session?.pause?.()

@@ -78,7 +78,7 @@ const wavPath = GLib.build_filenamev([tmp, 'fixture.wav'])
 }
 
 // --- fakes: the synth side mirrors the LocalTTS contract, the play
-// side mirrors the playWav promise contract ---
+// side mirrors the playWav session contract ---
 
 // fake LocalTTS: returns a real wav fixture; with hold, synth promises
 // stay pending until release() — and stopAll() rejects them, exactly
@@ -119,27 +119,32 @@ class FakeTTS {
     }
 }
 
-// fake playWav: one session per call, blocked until release(); stop()
-// rejects with the contracted stop error. Records the rate and every
-// pause/resume/stop/setRate hook the player delivers.
-const makeFakePlayWav = () => {
+// fake playWav: an async factory (like the GStreamer default), one
+// session per call, blocked until release(); stop() rejects with the
+// contracted stop error, rejectNow() with an arbitrary one. Records the
+// rate and every pause/resume/stop/setRate hook the player delivers.
+// An optional gate holds the factory itself open, so a stop() that
+// lands mid-creation can be driven.
+const makeFakePlayWav = ({ gate = null } = {}) => {
     const sessions = []
-    const playWav = (path, { rate } = {}) => {
+    const playWav = async (path, { rate } = {}) => {
+        if (gate) await gate
         const session = { path, rate, hooks: [] }
-        const promise = new Promise((resolve, reject) => {
+        session.done = new Promise((resolve, reject) => {
             session.release = () => resolve()
             session.stopPipeline = () =>
                 reject(new Error('playback stopped'))
+            session.rejectNow = reject
         })
-        promise.pause = () => session.hooks.push('pause')
-        promise.resume = () => session.hooks.push('resume')
-        promise.stop = () => {
+        session.pause = () => session.hooks.push('pause')
+        session.resume = () => session.hooks.push('resume')
+        session.stop = () => {
             session.hooks.push('stop')
             session.stopPipeline()
         }
-        promise.setRate = rate => session.hooks.push(['setRate', rate])
+        session.setRate = rate => session.hooks.push(['setRate', rate])
         sessions.push(session)
-        return promise
+        return session
     }
     return { playWav, sessions }
 }
@@ -151,9 +156,9 @@ const PACK = { id: 'kokoro', sid: 23 }
 
 // harness for one scenario: fresh fakes, a player over them, and the
 // callback collectors the assertions read afterwards
-const start = ({ hold = false, failTexts } = {}) => {
+const start = ({ hold = false, failTexts, gate } = {}) => {
     const tts = new FakeTTS({ hold, failTexts })
-    const fake = makeFakePlayWav()
+    const fake = makeFakePlayWav({ gate })
     const marks = []
     const ends = []
     const errors = []
@@ -173,7 +178,9 @@ const start = ({ hold = false, failTexts } = {}) => {
         })
         return done
     }
-    return { tts, sessions: fake.sessions, marks, ends, errors, player, run }
+    return {
+        tts, sessions: fake.sessions, marks, ends, errors, player, run,
+    }
 }
 
 // --- the queue plays sentences in order, marking at play-start ---
@@ -330,6 +337,34 @@ const start = ({ hold = false, failTexts } = {}) => {
     assert(tts.stopAllCount >= 1, 'stop() cancelled synthesis via stopAll()')
 }
 
+// --- stop() then play() in the same tick restarts instead of rejecting ---
+
+{
+    const { tts, sessions, ends, errors, run, player } = start({
+        hold: true,
+    })
+    const first = run(2)
+    await waitFor(() => tts.calls.length === 1)
+    tts.release()
+    assert(await waitFor(() => sessions.length === 1),
+        'the first run started playing')
+    player.stop()
+    const second = run(1) // same tick as the stop: must not reject
+    await settle(first)
+    assert(ends.length >= 1 && ends[0] === null,
+        `the stopped run reported onEnd(null) (got: ${JSON.stringify(ends)})`)
+    await waitFor(() => tts.calls.length === 2) // the restart's synth
+    tts.release()
+    assert(await waitFor(() => sessions.length === 2),
+        'the restart after the stop started playing')
+    assert(JSON.stringify(sessions[1].hooks) === '[]',
+        'the restart starts unpaused (hooks: ' +
+        `${JSON.stringify(sessions[1].hooks)})`)
+    sessions[1].release()
+    await settle(second)
+    assert(errors.length === 0, 'neither run reported an error')
+}
+
 // --- pause() and resume() reach the active pipeline ---
 
 {
@@ -350,47 +385,137 @@ const start = ({ hold = false, failTexts } = {}) => {
         'playback finished after resume')
 }
 
-// --- a session created while paused starts paused ---
+// --- a pause with nothing playing does not turn the next run silent ---
 
 {
-    const { sessions, run, player } = start({ hold: false })
+    const { sessions, ends, run, player } = start({ hold: false })
     player.pause() // paused before anything plays
     const done = run(1)
     assert(await waitFor(() => sessions.length === 1),
-        'playback started while paused')
-    assert(JSON.stringify(sessions[0].hooks) === '["pause"]',
-        'a session created while paused starts paused (hooks: ' +
-        `${JSON.stringify(sessions[0].hooks)})`)
-    player.resume()
-    assert(JSON.stringify(sessions[0].hooks) === '["pause","resume"]',
-        'resume() reaches the paused session (hooks: ' +
+        'playback started after a pre-play pause')
+    assert(JSON.stringify(sessions[0].hooks) === '[]',
+        'a fresh run starts unpaused (hooks: ' +
         `${JSON.stringify(sessions[0].hooks)})`)
     sessions[0].release()
+    await settle(done)
+    assert(ends.length === 1 && ends[0] === null,
+        `the unpaused run finished (got: ${JSON.stringify(ends)})`)
+}
+
+// --- a session rejection that is not a stop is a failure ---
+
+{
+    const { sessions, ends, errors, run } = start({ hold: false })
+    const done = run(2)
+    assert(await waitFor(() => sessions.length === 1),
+        'playback started before the pipeline failure')
+    sessions[0].rejectNow(new Error('boom'))
+    await settle(done)
+    assert(errors.length === 1 && /boom/.test(errors[0].message),
+        'a non-stop session rejection surfaces onError (got: ' +
+        `${errors.map(String)})`)
+    assert(ends.length === 0, 'a failed session fires no onEnd')
+}
+
+// --- onMark carries the provided index, not the array position ---
+
+{
+    const { sessions, player } = start()
+    const marks = []
+    const done = player.play(
+        [{ text: 'One.', index: 7 }, { text: 'Two.', index: 9 }], {
+            pack: PACK,
+            onMark: index => marks.push(index),
+        })
+    done.catch(error => {
+        failures++
+        printerr('FAIL: unexpected play() rejection: ' +
+            `${error?.message ?? error}`)
+    })
+    assert(await waitFor(() => sessions.length === 1),
+        'playback started with custom indexes')
+    assert(JSON.stringify(marks) === '[7]',
+        `onMark passes the provided index (got: ${JSON.stringify(marks)})`)
+    sessions[0].release()
+    assert(await waitFor(() => sessions.length === 2),
+        'the second sentence played')
+    assert(JSON.stringify(marks) === '[7,9]',
+        `every mark carries its own index (got: ${JSON.stringify(marks)})`)
+    sessions[1].release()
     await settle(done)
 }
 
-// --- a synth rejection surfaces onError and halts the queue ---
+// --- a stop issued from inside onMark stops the marked sentence too ---
 
 {
-    const { tts, sessions, marks, ends, errors, run } = start({
-        failTexts: ['Two.'],
+    const { tts, sessions, player } = start({
+        hold: true,
     })
-    const done = run(3)
-    assert(await waitFor(() => sessions.length === 1),
-        'playback started before the failure')
-    sessions[0].release()
+    const marks = []
+    const ends = []
+    const errors = []
+    let stoppedFromMark = false
+    let callsAtStop = null
+    const done = player.play(sentencesOf(3), {
+        pack: PACK,
+        onMark: index => {
+            marks.push(index)
+            if (index === 0) {
+                stoppedFromMark = true
+                callsAtStop = tts.calls.length
+                player.stop()
+            }
+        },
+        onEnd: value => ends.push(value),
+        onError: error => errors.push(error),
+    })
+    done.catch(error => {
+        failures++
+        printerr('FAIL: unexpected play() rejection: ' +
+            `${error?.message ?? error}`)
+    })
+    await waitFor(() => tts.calls.length === 1)
+    tts.release()
     await settle(done)
-    assert(errors.length === 1 && /engine exploded/.test(errors[0].message),
-        'a synth rejection surfaces onError (got: ' +
-        `${errors.map(String)})`)
+    assert(stoppedFromMark, 'onMark ran for the first sentence')
     assert(JSON.stringify(marks) === '[0]',
-        `no marks after the failure (got: ${JSON.stringify(marks)})`)
-    assert(sessions.length === 1, 'playback of later sentences stopped')
-    assert(ends.length === 0, 'a failed run does not fire onEnd')
-    assert(JSON.stringify(tts.calls.map(c => c.text))
-            === JSON.stringify(['One.', 'Two.']),
-    'the queue stops asking for synth after a failure (got: ' +
-        `${JSON.stringify(tts.calls.map(c => c.text))})`)
+        `only the first mark fired (got: ${JSON.stringify(marks)})`)
+    assert(sessions.length === 0,
+        `the marked sentence never played (got: ${sessions.length})`)
+    assert(ends.length === 1 && ends[0] === null,
+        'the stopped run reported onEnd(null) once ' +
+        `(got: ${JSON.stringify(ends)})`)
+    assert(errors.length === 0, 'the stop is not an error')
+    await tick(30)
+    assert(tts.calls.length === callsAtStop,
+        `no synth starts after the stop (calls: ${tts.calls.length}, ` +
+        `at stop: ${callsAtStop})`)
+}
+
+// --- a stop landing mid-creation stops the fresh session silently ---
+
+{
+    const { tts, sessions, ends, errors, run, player } = start({
+        hold: true,
+        gate: new Promise(resolve =>
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100,
+                () => (resolve(), GLib.SOURCE_REMOVE))),
+    })
+    const done = run(2)
+    await waitFor(() => tts.calls.length === 1)
+    tts.release()
+    await tick(40) // the factory is now open but gated
+    player.stop()
+    await tick(60) // the gate opens; the session was created stopped
+    assert(await waitFor(() => sessions.length === 1),
+        'the gated session was created')
+    assert(JSON.stringify(sessions[0].hooks) === '["stop"]',
+        'a session created under a stop is stopped (hooks: ' +
+        `${JSON.stringify(sessions[0].hooks)})`)
+    await settle(done)
+    assert(ends.length === 1 && ends[0] === null,
+        `the gated run ended as a stop (got: ${JSON.stringify(ends)})`)
+    assert(errors.length === 0, 'the mid-creation stop is not an error')
 }
 
 // --- setRate retunes the active and following sentences ---
