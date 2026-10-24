@@ -108,15 +108,8 @@ assert(verifyPack(kokoroPack) === false, 'verifyPack false again after delete')
 assert(deletePack('not-a-real-pack') === false,
     'deletePack on missing pack returns false without throwing')
 
-// download is a stub in Task 1
-try {
-    await download(kokoroPack)
-    failures++
-    printerr('FAIL: download() should reject')
-} catch (e) {
-    assert(/not implemented/i.test(e.message),
-        `download rejects with clear error (got: ${e.message})`)
-}
+// download is implemented in Task 2 (see tests/voice-packs-download-test.mjs)
+assert(typeof download === 'function', 'download is exported')
 
 if (failures) {
     printerr(`${failures} test${failures > 1 ? 's' : ''} failed`)

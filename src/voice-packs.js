@@ -1,5 +1,6 @@
 import GLib from 'gi://GLib'
 import Gio from 'gi://Gio'
+import Soup from 'gi://Soup?version=3.0'
 
 // Voice packs for local neural TTS. Each entry describes a downloadable
 // model tarball (sherpa-onnx) unpacked under the app's data dir.
@@ -87,10 +88,107 @@ export const verifyPack = pack => {
     })
 }
 
-// Stub: streaming download to `<packDir>.part` with Gio.File copy_async,
-// progress callbacks, and atomic rename is implemented in Task 2.
-export const download = async () => {
-    throw new Error('download is not implemented in Task 1')
+// gjs 1.86 does not promise-wrap introspection methods whose callback
+// parameter is nullable — every libsoup async call is shaped that way —
+// so the async calls below use explicit callbacks wrapped in promises.
+const gioAsync = (object, method, finish, ...args) =>
+    new Promise((resolve, reject) => {
+        object[method](...args, (source, result) => {
+            try {
+                resolve(object[finish](result))
+            } catch (error) {
+                reject(error)
+            }
+        })
+    })
+
+// One shared session for every pack download: libsoup's recommended
+// pattern, and it keeps the teardown of failed or cancelled requests on
+// one long-lived object instead of on a session collected mid-flight.
+const soupSession = new Soup.Session()
+
+// 64 KiB read chunks for streaming the tarball
+const SIZE_CHUNK = 64 * 1024
+
+// Streams the pack tarball to `<packDir(id)>.part` with progress callbacks,
+// then unpacks it into packDir(id) with --strip-components=1 (sherpa-onnx
+// archives carry a top-level directory, and the expected files must land
+// directly in packDir(id)). The download is verified before unpacking: the
+// server-reported Content-Length must match what we received, and a pinned
+// pack.sha256 is checked against the .part file with
+// GLib.compute_checksum_for_bytes. A failed or cancelled download leaves
+// nothing behind: the .part file is always removed, and the pack directory
+// too when the unpack step failed after creating it.
+export const download = async (pack, onProgress = null, cancellable = null) => {
+    const dir = packDir(pack.id)
+    const part = Gio.File.new_for_path(`${dir}.part`)
+    const packDirFile = Gio.File.new_for_path(dir)
+    // never delete a pack directory that existed before this download
+    const preexisting = packDirFile.query_exists(null)
+    try {
+        part.get_parent().make_directory_with_parents(null)
+    } catch (error) {
+        if (error.code !== Gio.IOErrorEnum.EXISTS) throw error
+    }
+    const out = part.replace(null, false, Gio.FileCreateFlags.NONE, null)
+    let unpacking = false
+    let body = null
+    try {
+        const message = Soup.Message.new('GET', pack.url)
+        if (message === null)
+            throw new Error(`invalid pack URL: ${pack.url}`)
+        body = await gioAsync(soupSession, 'send_async', 'send_finish',
+            message, GLib.PRIORITY_DEFAULT, cancellable)
+        const total = message.get_response_headers().get_content_length()
+        let received = 0
+        let bytes
+        while ((bytes = await gioAsync(body, 'read_bytes_async',
+            'read_bytes_finish', SIZE_CHUNK, GLib.PRIORITY_DEFAULT,
+            cancellable)).get_size() > 0) {
+            await gioAsync(out, 'write_bytes_async', 'write_bytes_finish',
+                bytes, GLib.PRIORITY_DEFAULT, cancellable)
+            received += bytes.get_size()
+            if (onProgress && total > 0)
+                onProgress(Math.min(received / total, 1))
+        }
+        if (total > 0 && received !== total)
+            throw new Error(`size mismatch for ${pack.id}: ` +
+                `got ${received} of ${total} bytes`)
+        await out.close(null)
+        if (pack.sha256) {
+            const [data] = part.load_bytes(null)
+            const digest =
+                GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256, data)
+            if (digest.toLowerCase() !== pack.sha256.toLowerCase())
+                throw new Error(`checksum mismatch for ${pack.id}: ` +
+                    `got ${digest}, expected ${pack.sha256}`)
+        }
+        try {
+            packDirFile.make_directory_with_parents(null)
+        } catch (error) {
+            if (error.code !== Gio.IOErrorEnum.EXISTS) throw error
+        }
+        unpacking = true
+        const unpack = Gio.Subprocess.new(
+            ['tar', '-xjf', part.get_path(), '--strip-components=1',
+                '-C', dir], Gio.SubprocessFlags.NONE)
+        await gioAsync(unpack, 'wait_check_async', 'wait_check_finish',
+            cancellable)
+        unpacking = false
+        // success: the .part file is no longer needed
+        return part.delete(null)
+    } catch (error) {
+        try { part.delete(null) } catch { /* nothing to remove */ }
+        if (unpacking && !preexisting) {
+            try {
+                deleteFile(packDirFile)
+            } catch { /* best effort */ }
+        }
+        throw error
+    } finally {
+        try { body?.close(null) } catch { /* ignore */ }
+        try { out.close(null) } catch { /* ignore */ }
+    }
 }
 
 const deleteFile = file => {
