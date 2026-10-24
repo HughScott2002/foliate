@@ -1,6 +1,7 @@
 import GLib from 'gi://GLib'
 import Gio from 'gi://Gio'
 import { packDir } from './voice-packs.js'
+import { getVoiceDaemon } from './voice-daemon.js'
 
 // Local neural TTS engine controller: builds the sherpa-onnx-offline-tts
 // command line for a pack, synthesizes one sentence at a time into a
@@ -83,7 +84,7 @@ const reap = proc => {
 // The 'data' tag is validated at its canonical offset (bytes 36-40): a
 // non-canonical chunk layout fails loudly instead of returning a
 // plausible-looking wrong duration.
-const parseWavDuration = path => {
+export const parseWavDuration = path => {
     const stream = Gio.File.new_for_path(path).read(null)
     try {
         const data = stream.read_bytes(44, null).get_data()
@@ -193,6 +194,23 @@ export class LocalTTS {
             text, pack.id, sidUsed, keyLang)}.wav`])
         if (GLib.file_test(wavPath, GLib.FileTest.IS_REGULAR))
             return { wavPath, duration: parseWavDuration(wavPath) }
+        // the foliate-voice daemon keeps models loaded; prefer it when up
+        // and fall back to the one-shot CLI engine if it is not (or failed)
+        const daemon = getVoiceDaemon()
+        if (daemon.running && !this.#proc) {
+            const partPath = `${wavPath}.part`
+            const partFile = Gio.File.new_for_path(partPath)
+            try {
+                const duration = await daemon.synth(text, partPath, pack,
+                    { lang: langUsed, cancellable })
+                moveFile(partPath, wavPath)
+                return { wavPath, duration }
+            } catch (e) {
+                try { partFile.delete(null) } catch { /* nothing staged */ }
+                if (cancellable?.is_cancelled()) throw new Error('synthesis stopped')
+                console.warn(`voice daemon synthesis failed, using CLI engine: ${e.message}`)
+            }
+        }
         if (this.#proc)
             throw new Error('a synthesis is already in progress')
         const cmd = GLib.getenv('FOLIATE_TTS_CMD') ?? ENGINE_CMD

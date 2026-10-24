@@ -10,10 +10,33 @@
         "--socket=fallback-x11",
         "--device=dri",
         "--socket=wayland",
+        "--socket=pulseaudio",
         "--filesystem=xdg-run/speech-dispatcher:ro",
         "--add-policy=Tracker3.dbus:org.freedesktop.Tracker3.Miner.Files=tracker:Documents"
     ],
     "modules" : [
+        {
+            "name": "sherpa-onnx",
+            "buildsystem": "simple",
+            "build-commands": [
+                "install -Dm755 bin/sherpa-onnx-offline-tts /app/bin/sherpa-onnx-offline-tts",
+                "mkdir -p /app/lib && cp -a lib/. /app/lib/"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "only-arches": ["x86_64"],
+                    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-linux-x64-shared.tar.bz2",
+                    "sha256": "c0bdb7907d3a74bba1d55d22bf4d9fa75586cf1530614ebe88a27b9118e015c4"
+                },
+                {
+                    "type": "archive",
+                    "only-arches": ["aarch64"],
+                    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.8/sherpa-onnx-v1.13.8-linux-aarch64-shared-cpu.tar.bz2",
+                    "sha256": "4e3734f82bc1379fd91f219f5869c7e9d03b7a4f7561907d8abca4849c51a789"
+                }
+            ]
+        },
         {
             "name" : "foliate",
             "buildsystem" : "meson",

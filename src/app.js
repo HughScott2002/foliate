@@ -10,6 +10,7 @@ import { vprintf } from './format.js'
 import * as utils from './utils.js'
 import { Library } from './library.js'
 import { BookViewer, importFiles } from './book-viewer.js'
+import { startVoiceDaemon } from './voice-daemon.js'
 
 const formatVersion = (a, b, c) => `${a ?? '?'}.${b ?? '?'}.${c ?? '?'}`
 
@@ -272,6 +273,10 @@ export const Application = GObject.registerClass({
         })) this.set_accels_for_action(key, val)
     }
     connectStartup() {
+        // foliate-voice daemon: loads voice models once, keeps them warm
+        // (first sentence has no model-load wait). Dies with the app: normal
+        // close SIGTERMs it; a force-kill trips its stdin watchdog.
+        startVoiceDaemon()
         const settings = utils.settings()
         if (settings) {
             const styleManager = Adw.StyleManager.get_default()

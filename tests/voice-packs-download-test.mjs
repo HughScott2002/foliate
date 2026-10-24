@@ -191,6 +191,25 @@ try {
         GLib.FileTest.EXISTS), 'the top-level stub dir was stripped')
     assert(verifyPack(stubPack) === true, 'verifyPack true after download')
 
+    const existing = { ...stubPack, id: 'existing' }
+    GLib.mkdir_with_parents(packDir(existing.id), 0o755)
+    GLib.file_set_contents(`${packDir(existing.id)}/tokens.txt`, 'keep me')
+    try {
+        await download(existing)
+        assert(false, 'download must not overwrite a preexisting pack directory')
+    } catch (error) {
+        assert(/already exists/i.test(error.message), 'preexisting pack reports recovery action')
+    }
+    assert(new TextDecoder().decode(Gio.File.new_for_path(
+        `${packDir(existing.id)}/tokens.txt`).load_contents(null)[1]) === 'keep me',
+    'preexisting model files preserved')
+    try {
+        await download({ ...stubPack, id: 'unsigned', sha256: null })
+        assert(false, 'unsigned voice downloads must reject')
+    } catch (error) {
+        assert(/checksum/i.test(error.message), 'unsigned download explains missing checksum')
+    }
+
     // a wrong pinned checksum fails the download and leaves nothing behind
     try {
         await download({ ...stubPack, id: 'badsum', sha256: '0'.repeat(64) })
@@ -206,13 +225,16 @@ try {
     }
 
     // a non-tarball body passes the download checks but fails the unpack:
-    // the pack dir created for it must not survive (sha256 skipped, so the
-    // checksum pass cannot be what rejects it)
+    // the staging directory created for it must not survive
     GLib.file_set_contents(GLib.build_filenamev([www, 'notes.txt']),
         'this is not a tarball')
     try {
-        await download({ ...stubPack, id: 'nottar', sha256: null,
-            url: `http://127.0.0.1:${port}/notes.txt` })
+        await download({
+            ...stubPack, id: 'nottar',
+            sha256: GLib.compute_checksum_for_string(
+                GLib.ChecksumType.SHA256, 'this is not a tarball', -1),
+            url: `http://127.0.0.1:${port}/notes.txt`,
+        })
         failures++
         printerr('FAIL: a non-tarball body should reject')
     } catch {
@@ -223,8 +245,8 @@ try {
     }
 
     // the same fixture downloaded as the real kokoro entry: the catalog
-    // (which has a null sha256) picks it up
-    await download({ ...kokoro, url: stubUrl })
+    // picks it up after fixture checksum verification
+    await download({ ...kokoro, url: stubUrl, sha256: fixtureSha })
     assert(verifyPack(kokoro) === true, 'verifyPack true for kokoro')
     assert(getInstalledPacks().some(p => p.id === 'kokoro'),
         'getInstalledPacks picks up the downloaded pack')

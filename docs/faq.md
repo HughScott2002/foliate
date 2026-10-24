@@ -22,13 +22,30 @@ Currently, it simply uses the number of locations — basically, a character cou
 
 ### How to use text-to-speech?
 
-Foliate supports text-to-speech with speech-dispatcher, so make sure `speech-dispatcher` and output modules such as `espeak-ng` are installed on your system.
+Open the book and click **Narration** (the headphones icon on the bottom
+bar), then **Play**. Choose a voice and click **Download** once. Narration
+then runs on your CPU, offline, without sending book text to a server.
 
 To use it, click on the <i>Narration</i> button (the one with a headphones icon) on the navbar (which is available by hovering or tapping on the footer area). Note that if the book has embedded audio ([EPUB Media Overlays](https://www.w3.org/TR/epub/#sec-media-overlays)), the <i>Narration</i> button would show controls for the embedded media, and TTS would not be available in that case.
 
-Alternatively you can select some text and choose <i>Speak from Here</i> from the selection menu. Though you still need to use the <i>Narration</i> button if you want to stop the speech output.
+Pause/resume, stop, and speed controls stay on the bottom bar while local
+narration is active, even when its menu is closed. The current sentence
+is highlighted and narration advances through the book's sections.
+You can also select text and choose **Speak from Here**.
 
-The default voice may sound somewhat robotic. You can use [Pied](https://pied.mikeasoft.com/) (a frontend for configuring [Piper](https://github.com/rhasspy/piper)) to change that to a more natural sounding voice. See [this](https://askubuntu.com/a/1526192/124466) for more details.
+**Choose Voice…** offers Kokoro (English/Chinese, 141 MB), Supertonic 3
+(31 languages, 123 MB), and Piper Amy (English, 64 MB). Supported book
+languages choose a suitable pack automatically; your choice is saved for
+each book. Preview installed voices there, or remove them to reclaim disk
+space. Downloads require an internet connection and are checksum-verified.
+
+Models are stored under `XDG_DATA_HOME/foliate/voices`; generated audio
+is cached under `XDG_CACHE_HOME/foliate/tts-wav`. Flatpak keeps these
+inside its sandbox. Neither directory is needed for book annotations.
+
+For the existing accessibility setup, select **System speech (Speech
+Dispatcher)** in the Narration menu. This requires `speech-dispatcher`
+and an output module such as `espeak-ng` on your system.
 
 ### How to use custom themes?
 
@@ -116,6 +133,7 @@ In 1.x and 2.x versions of Foliate, JavaScript could be optionally enabled. Do N
 ### Why does it require these Flatpak permissions?
 
 - It requires network access (`--share=network`) for online dictionary, encyclopedia, and translation tools.
+- It requires audio access (`--socket=pulseaudio`) for local narration and embedded book audio.
 - It requires `--filesystem=xdg-run/speech-dispatcher:ro` in order to connect to the speech-dispatcher server on the host.
 - It requires `--add-policy=Tracker3.dbus:org.freedesktop.Tracker3.Miner.Files=tracker:Documents` in order to access the [Tracker](https://tracker.gnome.org/) database on the host. This allows Foliate to get the locations of files when opening books from the library view.
 

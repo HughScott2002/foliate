@@ -84,6 +84,32 @@
     </object>
   </child>
   <child>
+    <object class="GtkBox" id="narration-controls">
+      <property name="visible">False</property>
+      <property name="valign">center</property>
+      <style><class name="linked"/></style>
+      <child>
+        <object class="GtkButton" id="narration-play">
+          <property name="icon-name">media-playback-pause-symbolic</property>
+          <property name="tooltip-text" translatable="yes">Pause narration</property>
+        </object>
+      </child>
+      <child>
+        <object class="GtkButton" id="narration-stop">
+          <property name="icon-name">media-playback-stop-symbolic</property>
+          <property name="tooltip-text" translatable="yes">Stop narration</property>
+        </object>
+      </child>
+      <child>
+        <object class="GtkSpinButton" id="narration-rate">
+          <property name="digits">2</property>
+          <property name="numeric">True</property>
+          <property name="tooltip-text" translatable="yes">Narration speed multiplier</property>
+        </object>
+      </child>
+    </object>
+  </child>
+  <child>
     <object class="GtkMenuButton">
       <property name="valign">center</property>
       <property name="direction">up</property>

@@ -4,10 +4,13 @@ import { gettext as _ } from 'gettext'
 
 import * as utils from './utils.js'
 import { SSIPClient } from './speech.js'
+import { LocalTTS } from './local-tts.js'
+import { LocalTTSPlayer } from './local-tts-player.js'
+import { getInstalledPacks } from './voice-packs.js'
 
 const ssip = new SSIPClient()
 
-GObject.registerClass({
+export const TTSBox = GObject.registerClass({
     GTypeName: 'FoliateTTSBox',
     Template: pkg.moduleuri('ui/tts-box.ui'),
     Signals: {
@@ -23,13 +26,28 @@ GObject.registerClass({
             return_type: GObject.TYPE_JSOBJECT,
         },
         'next-section': { return_type: GObject.TYPE_JSOBJECT },
+        'parse': {
+            param_types: [GObject.TYPE_STRING],
+            return_type: GObject.TYPE_JSOBJECT,
+        },
+        'clear-highlight': {},
+        'voices-requested': { param_types: [GObject.TYPE_BOOLEAN] },
+        'state-changed': { param_types: [GObject.TYPE_STRING] },
     },
     InternalChildren: [
         'tts-rate-scale', 'tts-pitch-scale',
         'media-buttons', 'play-button',
+        'system-controls', 'local-controls', 'backend-dropdown',
+        'local-rate', 'voice-label', 'manage-voices-button',
     ],
 }, class extends Gtk.Box {
     #state = 'stopped'
+    #generation = 0
+    #settings = utils.settings('viewer')
+    #backend = this.#settings?.get_string('tts-backend') ?? 'local'
+    #player = new LocalTTSPlayer({ tts: new LocalTTS() })
+    language = 'en'
+    pack = null
     defaultWidget = this._play_button
     constructor(params) {
         super(params)
@@ -40,6 +58,28 @@ GObject.registerClass({
 
         this.#connectScale(this._tts_rate_scale, ssip.setRate.bind(ssip))
         this.#connectScale(this._tts_pitch_scale, ssip.setPitch.bind(ssip))
+        this._backend_dropdown.selected = this.backend === 'local' ? 0 : 1
+        this._backend_dropdown.connect('notify::selected', dropdown => {
+            this.stop()
+            this.#backend = dropdown.selected === 0 ? 'local' : 'speechd'
+            this.#settings?.set_string('tts-backend', this.backend)
+            this.#syncBackend()
+        })
+        this._local_rate.connect('value-changed', spin =>
+            this.#player.setRate(spin.value))
+        this._manage_voices_button.connect('clicked', () => this.emit('voices-requested', false))
+        this.#syncBackend()
+    }
+    get backend() { return this.#backend }
+    get rateAdjustment() { return this._local_rate.adjustment }
+    #syncBackend() {
+        this._system_controls.visible = this.backend === 'speechd'
+        this._local_controls.visible = this.backend === 'local'
+    }
+    setPack(pack) {
+        this.stop()
+        this.pack = pack
+        this._voice_label.label = pack?.label ?? _('Download a voice to get started')
     }
     #connectScale(scale, f) {
         scale.connect('value-changed', scale => {
@@ -59,6 +99,7 @@ GObject.registerClass({
         this._play_button.icon_name = state === 'playing'
             ? 'media-playback-pause-symbolic'
             : 'media-playback-start-symbolic'
+        this.emit('state-changed', state)
     }
     #init() {
         return ssip.stop().then(() => this.emit('init'))
@@ -76,6 +117,7 @@ GObject.registerClass({
         if (state === 'END') this.forward()
     }
     speak(ssml) {
+        if (this.backend === 'local') return this.#beginLocal(null, ssml)
         this.#init().then(() => this.#speak(ssml)).catch(e => this.error(e))
     }
     play() {
@@ -83,6 +125,14 @@ GObject.registerClass({
         else this.pause()
     }
     start() {
+        if (this.backend === 'local') {
+            if (this.state === 'paused') {
+                this.#player.resume()
+                this.state = 'playing'
+                return
+            }
+            return this.#beginLocal('start')
+        }
         this.#init()
             .then(() => this.#speak(this.state === 'paused'
                 ? this.emit('resume')
@@ -91,13 +141,18 @@ GObject.registerClass({
     }
     pause() {
         this.state = 'paused'
+        if (this.backend === 'local') return this.#player.pause()
         ssip.stop().catch(e => this.error(e))
     }
     stop() {
+        ++this.#generation
+        this.#player.stop()
         this.state = 'stopped'
-        ssip.stop().catch(e => this.error(e))
+        this.emit('clear-highlight')
+        if (this.backend === 'speechd') ssip.stop().catch(e => console.debug(e))
     }
     backward() {
+        if (this.backend === 'local') return this.#beginLocal('backward')
         this.#init()
             .then(() => this.state === 'playing'
                 ? this.#speak(this.emit('backward'))
@@ -105,6 +160,7 @@ GObject.registerClass({
             .catch(e => this.error(e))
     }
     forward() {
+        if (this.backend === 'local') return this.#beginLocal('forward')
         this.#init()
             .then(() => this.state === 'playing'
                 ? this.#speak(this.emit('forward'))
@@ -112,12 +168,70 @@ GObject.registerClass({
             .catch(e => this.error(e))
     }
     error(e) {
-        this.state = 'stopped'
+        this.stop()
         console.error(e)
         this.root.error(_('Text-to-Speech Error'),
-            _('Make sure Speech Dispatcher is installed and working on your system'))
+            this.backend === 'local' ? e.message
+            : _('Make sure Speech Dispatcher is installed and working on your system'))
+    }
+    async #beginLocal(command, ssml) {
+        if (!this.pack || !getInstalledPacks().some(x => x.id === this.pack.id)) {
+            this.emit('voices-requested', true)
+            return
+        }
+        const generation = ++this.#generation
+        this.#player.stop()
+        this.state = 'playing'
+        try {
+            await this.emit('init')
+            if (generation !== this.#generation) return
+            const text = command ? await this.emit(command) : await ssml
+            if (generation !== this.#generation) return
+            await this.#speakLocal(text, generation)
+        } catch (e) {
+            if (generation === this.#generation) this.error(e)
+        }
+    }
+    async #speakLocal(ssml, generation) {
+        if (!ssml) {
+            if (await this.emit('next-section')) {
+                if (generation !== this.#generation) return
+                ssml = await this.emit('forward')
+            }
+            if (!ssml) {
+                if (generation === this.#generation) this.stop()
+                return
+            }
+        }
+        if (generation !== this.#generation) return
+        const { sentences, language } = await this.emit('parse', ssml)
+        if (generation !== this.#generation) return
+        let failed = false
+        await this.#player.play(sentences, {
+            pack: this.pack,
+            lang: (language || this.language).split('-')[0],
+            rate: this._local_rate.value,
+            onMark: mark => {
+                if (this.state === 'paused') this.#player.pause()
+                if (generation === this.#generation)
+                    Promise.resolve(this.emit('highlight', String(mark)))
+                        .catch(e => {
+                            if (generation === this.#generation) this.error(e)
+                        })
+            },
+            onError: e => {
+                failed = true
+                if (generation === this.#generation) this.error(e)
+            },
+        })
+        if (!failed && generation === this.#generation) {
+            const next = await this.emit('forward')
+            if (generation === this.#generation) await this.#speakLocal(next, generation)
+        }
     }
     kill() {
+        ++this.#generation
+        this.#player.stop()
         this.emit = () => {}
         if (this.state === 'playing') ssip.stop().catch(e => console.error(e))
     }
@@ -138,6 +252,7 @@ GObject.registerClass({
         'stop': {},
         'backward': {},
         'forward': {},
+        'state-changed': { param_types: [GObject.TYPE_STRING] },
     },
     InternalChildren: [
         'volume-scale',
@@ -169,6 +284,7 @@ GObject.registerClass({
         this._play_button.icon_name = state === 'playing'
             ? 'media-playback-pause-symbolic'
             : 'media-playback-start-symbolic'
+        this.emit('state-changed', state)
     }
     play() {
         if (this.#state !== 'playing') this.start()

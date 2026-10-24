@@ -1,6 +1,7 @@
 import Gtk from 'gi://Gtk'
 import GObject from 'gi://GObject'
 import Pango from 'gi://Pango'
+import { gettext as _ } from 'gettext'
 import * as utils from './utils.js'
 import * as format from './format.js'
 import './tts.js'
@@ -130,6 +131,8 @@ GObject.registerClass({
         'loc-entry', 'loc-total', 'cfi-entry',
         'section-entry', 'section-total', 'section-buttons',
         'location-popover-stack', 'landmark-view', 'landmark-toggle',
+        'narration-controls', 'narration-play', 'narration-stop',
+        'narration-rate',
     ],
     Signals: {
         'go-to-cfi': { param_types: [GObject.TYPE_STRING] },
@@ -148,6 +151,11 @@ GObject.registerClass({
             closed()
         })
         this._tts_popover.connect('closed', closed)
+        for (const box of [this.tts_box, this.media_overlay_box])
+            box.connect('state-changed', () => this.#syncNarration())
+        this._narration_play.connect('clicked', () => this.#narration.play())
+        this._narration_stop.connect('clicked', () => this.#narration.stop())
+        this._narration_rate.adjustment = this.tts_box.rateAdjustment
         this._loc_entry.connect('activate', entry => {
             this.emit('go-to-fraction', parseInt(entry.text) / this.#locationTotal)
             this._location_popover.popdown()
@@ -176,6 +184,22 @@ GObject.registerClass({
     }
     get shouldStayVisible() {
         return this._location_popover.visible || this._tts_popover.visible
+            || this.#narration.state !== 'stopped'
+    }
+    get #narration() {
+        return this._tts_stack.visible_child_name === 'media-overlay'
+            ? this.media_overlay_box : this.tts_box
+    }
+    #syncNarration() {
+        const state = this.#narration.state
+        this._narration_controls.visible = state !== 'stopped'
+        this._narration_play.icon_name = state === 'playing'
+            ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic'
+        this._narration_play.tooltip_text = state === 'playing'
+            ? _('Pause narration') : _('Resume narration')
+        this._narration_rate.visible = this.#narration === this.tts_box
+            && this.tts_box.backend === 'local'
+        this.emit(state === 'stopped' ? 'closed' : 'opened')
     }
     update(progress) {
         const { fraction, section, location, time, cfi, pageItem } = progress
@@ -233,5 +257,6 @@ GObject.registerClass({
     setTTSType(name) {
         this._tts_stack.visible_child_name = name
         this._tts_popover.default_widget = this._tts_stack.visible_child.defaultWidget
+        this.#syncNarration()
     }
 })

@@ -55,4 +55,9 @@ else {
 pkg.useResource = MESON
 
 const { Application } = await import(pkg.moduleuri('app.js'))
-exit(await new Application().runAsync([programInvocationName, ...programArgs]))
+const code = await new Application().runAsync([programInvocationName, ...programArgs])
+const { stopVoiceDaemon } = await import(pkg.moduleuri('voice-daemon.js'))
+// stop the voice daemon before exit: SIGTERM, and warn if it survives
+// (its stdin watchdog reaps it on a force-kill regardless)
+await stopVoiceDaemon()
+exit(code)

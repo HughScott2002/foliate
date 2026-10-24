@@ -12,6 +12,8 @@ if get_option('check_runtime_deps')
     dependency('gtk4', version: '>= 4.12')
     dependency('libadwaita-1', version: '>= 1.8')
     dependency('webkitgtk-6.0', version: '>= 2.40.1')
+    dependency('libsoup-3.0')
+    dependency('gstreamer-play-1.0', version: '>= 1.20')
 endif
 
 subdir('data')

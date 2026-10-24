@@ -40,6 +40,10 @@
 
   <schema id="com.github.johnfactotum.Foliate.viewer"
     path="/com/github/johnfactotum/Foliate/viewer/">
+    <key name="tts-backend" type="s">
+      <choices><choice value="local"/><choice value="speechd"/></choices>
+      <default>'local'</default>
+    </key>
     <child schema="com.github.johnfactotum.Foliate.viewer.view" name="view"/>
     <child schema="com.github.johnfactotum.Foliate.viewer.font" name="font"/>
     <key name="fold-sidebar" type="b">

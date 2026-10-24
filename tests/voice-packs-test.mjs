@@ -39,9 +39,9 @@ assert(packs.find(p => p.id === 'kokoro').languages.join() === 'en,zh',
     'kokoro languages are en, zh')
 assert(packs.find(p => p.id === 'supertonic').languages.length === 31,
     'supertonic lists 31 languages')
-assert(['en', 'zh', 'fr'].every(l =>
+assert(['en', 'lt', 'fr'].every(l =>
     packs.find(p => p.id === 'supertonic').languages.includes(l)),
-'supertonic languages include en, zh, fr')
+'supertonic languages include en, lt, fr')
 assert(packs.find(p => p.id === 'kokoro').sid === 23, 'kokoro default sid is 23')
 assert(packs.find(p => p.id === 'supertonic').sid === 0,
     'supertonic default sid is 0')

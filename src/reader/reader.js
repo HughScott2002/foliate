@@ -1,5 +1,6 @@
 import { makeBook, NotFoundError, UnsupportedTypeError } from '../foliate-js/view.js'
 import { Overlayer } from '../foliate-js/overlayer.js'
+import { parseSSML, NarrationHighlight } from './tts.js'
 import { FootnoteHandler } from '../foliate-js/footnotes.js'
 import { toPangoMarkup } from './markup.js'
 
@@ -282,6 +283,33 @@ class Reader {
         document.body.append(this.view)
         this.sectionFractions = this.view.getSectionFractions()
     }
+    narrationHighlight = new NarrationHighlight()
+    async initTTS(local = false) {
+        if (this.localNarration !== local) this.view.tts = null
+        this.localNarration = local
+        await this.view.initTTS(local ? 'sentence' : 'word', local ? range => {
+            this.view.renderer.scrollToAnchor(range, true)
+            this.narrationHighlight.show(range)
+        } : undefined)
+    }
+    ttsStart() {
+        const range = this.view.lastLocation?.range
+        return this.localNarration && range ? this.view.tts.from(range)
+            : this.view.tts.start()
+    }
+    ttsParse(ssml) { return parseSSML(ssml) }
+    ttsClear() { this.narrationHighlight.clear() }
+    async ttsNextSection() {
+        const index = this.view.renderer.getContents()[0]?.index
+        if (index == null) return false
+        const next = this.book.sections.findIndex((section, i) =>
+            i > index && section.linear !== 'no')
+        if (next < 0) return false
+        this.ttsClear()
+        await this.view.renderer.goTo({ index: next })
+        await this.initTTS(this.localNarration)
+        return true
+    }
     setAppearance({ style, layout, autohideCursor }) {
         Object.assign(this.style, style)
         const { theme } = style
@@ -423,8 +451,9 @@ class Reader {
                     this.printRange(range.startContainer.ownerDocument, range)
                     break
                 case 'speak-from-here':
-                    this.view.initTTS().then(() => emit({
-                        type: 'selection', action,
+                case 'speak-from-here-local':
+                    this.initTTS(action === 'speak-from-here-local').then(() => emit({
+                        type: 'selection', action: 'speak-from-here',
                         ssml: this.view.tts.from(range),
                     }))
                     break

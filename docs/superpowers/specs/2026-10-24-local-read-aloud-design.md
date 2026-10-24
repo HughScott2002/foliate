@@ -38,10 +38,11 @@ All three run on one engine: sherpa-onnx (ONNX Runtime, int8).
 |---|---|---|---|---|
 | Kokoro-82M int8 | ~141 MB | en, zh | Apache-2.0 | default |
 | Supertonic 3 int8 | ~123 MB | 31 | MIT | multilingual |
-| Piper (VITS) | ~79 MB | ~30 | GPL-3 | slow machines |
+| Piper Amy low (VITS) | ~64 MB | en | see upstream model card | slow machines |
 
-Weights downloaded at runtime from upstream releases (keeps GPL weights
-out of the Flatpak). Engine binary ships with the app.
+Weights downloaded at runtime from upstream releases. Model licensing is
+separate from engine licensing; retain each pack's upstream license/model
+card. Engine binary ships with the app.
 
 ## Approaches considered
 
@@ -68,6 +69,8 @@ C. Run kokoro-js in the WebKit view — no native dep, but WASM speed in
 - Flatpak: add GStreamer runtime + `--socket=pulseaudio`; network already
   present (`--share=network`).
 - NixOS dev: sherpa-onnx release tarball in the dev shell (autoPatchelf).
+- Runtime pinned to 1.13.8: 2.0 removed the built-in Piper phonemizer.
+- Preview samples are synthesized locally after installation, not bundled clips.
 
 ## Left to the builder
 

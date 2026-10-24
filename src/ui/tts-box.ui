@@ -4,7 +4,65 @@
   <property name="orientation">vertical</property>
   <property name="spacing">9</property>
   <child>
-    <object class="GtkGrid">
+    <object class="GtkDropDown" id="backend-dropdown">
+      <property name="tooltip-text" translatable="yes">Narration engine</property>
+      <property name="model">
+        <object class="GtkStringList">
+          <items>
+            <item translatable="yes">Local neural voice</item>
+            <item translatable="yes">System speech (Speech Dispatcher)</item>
+          </items>
+        </object>
+      </property>
+    </object>
+  </child>
+  <child>
+    <object class="GtkBox" id="local-controls">
+      <property name="orientation">vertical</property>
+      <property name="spacing">9</property>
+      <child>
+        <object class="GtkLabel" id="voice-label">
+          <property name="label" translatable="yes">Download a voice to get started</property>
+          <property name="wrap">True</property>
+          <property name="xalign">0</property>
+        </object>
+      </child>
+      <child>
+        <object class="GtkButton" id="manage-voices-button">
+          <property name="label" translatable="yes">Choose Voice…</property>
+        </object>
+      </child>
+      <child>
+        <object class="GtkBox">
+          <property name="spacing">12</property>
+          <child>
+            <object class="GtkLabel">
+              <property name="label" translatable="yes">Speed</property>
+              <property name="hexpand">True</property>
+              <property name="xalign">0</property>
+            </object>
+          </child>
+          <child>
+            <object class="GtkSpinButton" id="local-rate">
+              <property name="tooltip-text" translatable="yes">Narration speed multiplier</property>
+              <property name="digits">2</property>
+              <property name="numeric">True</property>
+              <property name="adjustment">
+                <object class="GtkAdjustment">
+                  <property name="lower">0.75</property>
+                  <property name="upper">2</property>
+                  <property name="step-increment">0.05</property>
+                  <property name="value">1</property>
+                </object>
+              </property>
+            </object>
+          </child>
+        </object>
+      </child>
+    </object>
+  </child>
+  <child>
+    <object class="GtkGrid" id="system-controls">
       <property name="column-spacing">6</property>
       <property name="row-spacing">9</property>
       <property name="margin-start">6</property>

@@ -1,5 +1,4 @@
 import Gio from 'gi://Gio'
-
 // Sentence-level playback queue on top of a LocalTTS instance: synthesize
 // ahead of playback (at most two sentences beyond the one being played,
 // executed strictly one at a time because LocalTTS rejects concurrent
@@ -166,7 +165,7 @@ export class LocalTTSPlayer {
         // advances, and the chain above serializes execution, so at most
         // one engine process runs at any moment
         const kick = () => {
-            while (queued < Math.min(playIndex + 2, sentences.length - 1))
+            while (queued < Math.min(playIndex + 4, sentences.length - 1))
                 synth(++queued)
         }
         kick()

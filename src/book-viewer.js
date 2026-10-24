@@ -21,6 +21,8 @@ import { ImageViewer } from './image-viewer.js'
 import { formatLanguageMap, formatAuthors, makeBookInfoWindow } from './book-info.js'
 import { themes, invertTheme, themeCssProvider } from './themes.js'
 import { dataStore, BookData } from './data.js'
+import { VoiceManagerDialog } from './voice-manager.js'
+import { getPacks, getInstalledPacks, pickPackForLanguage } from './voice-packs.js'
 
 // for use in the WebView
 const uiText = {
@@ -400,12 +402,15 @@ GObject.registerClass({
     addAnnotation(x) { return this.#exec('reader.view.addAnnotation', x) }
     deleteAnnotation(x) { return this.#exec('reader.view.deleteAnnotation', x) }
     print() { return this.#exec('reader.print') }
-    initTTS(x) { return this.#exec('reader.view.initTTS', x) }
-    ttsStart() { return this.#exec('reader.view.tts.start') }
+    initTTS(x) { return this.#exec('reader.initTTS', x) }
+    ttsStart() { return this.#exec('reader.ttsStart') }
     ttsPrev(x) { return this.#exec('reader.view.tts.prev', x) }
     ttsNext(x) { return this.#exec('reader.view.tts.next', x) }
     ttsResume() { return this.#exec('reader.view.tts.resume') }
     ttsSetMark(x) { return this.#exec('reader.view.tts.setMark', x) }
+    ttsParse(x) { return this.#exec('reader.ttsParse', x) }
+    ttsClear() { return this.#exec('reader.ttsClear') }
+    ttsNextSection() { return this.#exec('reader.ttsNextSection') }
     mediaOverlayStart() { return this.#exec('reader.view.startMediaOverlay') }
     mediaOverlayPause() { return this.#exec('reader.view.mediaOverlay.pause') }
     mediaOverlayResume() { return this.#exec('reader.view.mediaOverlay.resume') }
@@ -529,6 +534,7 @@ export const BookViewer = GObject.registerClass({
     #book
     #cover
     #data
+    #voiceManager
     constructor(params) {
         super(params)
         utils.connect(this._view, {
@@ -626,12 +632,12 @@ export const BookViewer = GObject.registerClass({
             () => this._navbar.shouldStayVisible)
         this._view_popover.connect('closed', autohideHeaderbar.hide)
         this._bookmark_button.connect('clicked', autohideHeaderbar.hide)
-        this._navbar.connect('closed', autohideNavbar.hide)
+        this._navbar.connect('closed', autohideNavbar.sync)
         this._navbar.connect('opened', autohideNavbar.show)
         this._view.webView.add_controller(utils.connect(new Gtk.GestureClick(), {
             'pressed': () => {
                 autohideHeaderbar.hide()
-                autohideNavbar.hide()
+                autohideNavbar.sync()
             },
         }))
 
@@ -709,7 +715,7 @@ export const BookViewer = GObject.registerClass({
 
         // TTS
         utils.connect(this._navbar.tts_box, {
-            'init': () => this._view.initTTS(),
+            'init': () => this._view.initTTS(this._navbar.tts_box.backend === 'local'),
             'start': () => this._view.ttsStart(),
             'resume': () => this._view.ttsResume(),
             'backward': () => this._view.ttsPrev(),
@@ -717,8 +723,10 @@ export const BookViewer = GObject.registerClass({
             'backward-paused': () => this._view.ttsPrev(true),
             'forward-paused': () => this._view.ttsNext(true),
             'highlight': (_, mark) => this._view.ttsSetMark(mark),
-            // FIXME: check if at end
-            'next-section': () => this._view.next().then(() => true),
+            'parse': (_, ssml) => this._view.ttsParse(ssml),
+            'clear-highlight': () => this._view.ttsClear().catch(e => console.debug(e)),
+            'next-section': () => this._view.ttsNextSection(),
+            'voices-requested': (_, startAfterSelection) => this.#showVoices(startAfterSelection),
         })
         utils.connect(this._navbar.media_overlay_box, {
             'start': () => this._view.mediaOverlayStart(),
@@ -852,6 +860,37 @@ export const BookViewer = GObject.registerClass({
             if (cover) this.#data.saveCover(cover)
         }
         else await this._view.next()
+        const language = book.metadata.language
+        const tts = this._navbar.tts_box
+        tts.language = (Array.isArray(language) ? language[0] : language) || 'en'
+        const primary = tts.language.toLowerCase().split(/[-_]/)[0]
+        const saved = this.#data?.storage.get('tts-voice-pack')
+        tts.setPack(getPacks().find(pack => pack.id === saved)
+            ?? getInstalledPacks().find(pack => pack.languages.includes(primary))
+            ?? pickPackForLanguage(primary))
+    }
+    #showVoices(startAfterSelection = false) {
+        if (this.#voiceManager) return
+        const tts = this._navbar.tts_box
+        tts.stop()
+        const dialog = new VoiceManagerDialog({
+            language: tts.language.split(/[-_]/)[0], selected: tts.pack?.id,
+        })
+        this.#voiceManager = dialog
+        dialog.connect('voice-selected', (_, pack) => {
+            tts.setPack(pack)
+            this.#data?.storage.set('tts-voice-pack', pack.id)
+            dialog.close()
+            if (startAfterSelection) tts.start()
+        })
+        dialog.connect('voice-removed', (_, id) => {
+            if (tts.pack?.id === id) {
+                tts.setPack(null)
+                this.#data?.storage.set('tts-voice-pack', null)
+            }
+        })
+        dialog.connect('closed', () => this.#voiceManager = null)
+        dialog.present(this.root)
     }
     #onRelocate(payload) {
         const { section, location, tocItem, cfi } = payload
@@ -913,7 +952,8 @@ export const BookViewer = GObject.registerClass({
                     this._search_view.doSearch()
                 },
                 'print': () => resolve('print'),
-                'speak-from-here': () => resolve('speak-from-here'),
+                'speak-from-here': () => resolve(this._navbar.tts_box.backend === 'local'
+                    ? 'speak-from-here-local' : 'speak-from-here'),
             }))
             utils.connect(popover, {
                 'show-popover': (_, popover) =>
@@ -1069,6 +1109,7 @@ export const BookViewer = GObject.registerClass({
         dialog.present(this.root)
     }
     vfunc_unroot() {
+        this.#voiceManager?.close()
         this._navbar.tts_box.kill()
         this._view.viewSettings.unbindSettings()
         this._view.fontSettings.unbindSettings()
