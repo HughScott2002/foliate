@@ -5,7 +5,8 @@ import Gio from 'gi://Gio'
 // Keep test state out of the real ~/.local/share/foliate: repoint
 // XDG_DATA_HOME at a temp dir before any packDir() call (resolution is lazy
 // inside the module, so this takes effect).
-GLib.setenv('XDG_DATA_HOME', GLib.dir_make_tmp(null), true)
+const tmp = GLib.dir_make_tmp(null)
+GLib.setenv('XDG_DATA_HOME', tmp, true)
 
 import {
     getPacks,
@@ -21,6 +22,23 @@ const assert = (cond, msg) => {
     if (cond) return
     failures++
     printerr(`FAIL: ${msg}`)
+}
+
+// recursive delete for cleanup in the finally block below
+const rmrf = file => {
+    if (file.query_file_type(Gio.FileQueryInfoFlags.NONE, null)
+            === Gio.FileType.DIRECTORY) {
+        const children = file.enumerate_children(
+            'standard::name', Gio.FileQueryInfoFlags.NONE, null)
+        try {
+            let info
+            while ((info = children.next_file(null)) != null)
+                rmrf(file.get_child(info.get_name()))
+        } finally {
+            children.close(null)
+        }
+    }
+    file.delete(null)
 }
 
 // --- fixture: a sherpa-onnx-shaped tarball (kokoro's shape) served over
@@ -60,11 +78,6 @@ probe.bind(Gio.InetSocketAddress.new(
 const port = probe.get_local_address().get_port()
 probe.close()
 
-const server = Gio.Subprocess.new(
-    ['python3', '-m', 'http.server', String(port),
-        '--bind', '127.0.0.1', '--directory', www],
-    Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
-
 const stubUrl = `http://127.0.0.1:${port}/stub.tar.bz2`
 
 // a fake pack entry: the kokoro entry repointed at the local fixture
@@ -79,7 +92,13 @@ const stubPack = {
         'lexicon-us-en.txt', 'dict', 'espeak-ng-data'],
 }
 
+let server = null
 try {
+    server = Gio.Subprocess.new(
+        ['python3', '-m', 'http.server', String(port),
+            '--bind', '127.0.0.1', '--directory', www],
+        Gio.SubprocessFlags.STDOUT_SILENCE |
+        Gio.SubprocessFlags.STDERR_SILENCE)
     // wait for the server to accept connections (plain TCP connect —
     // no Soup messages of its own to tear down)
     const client = new Gio.SocketClient()
@@ -116,6 +135,20 @@ try {
     } catch {
         assert(!GLib.file_test(packDir('badurl') + '.part', GLib.FileTest.EXISTS),
             'no .part left behind after a failed download')
+    }
+
+    // an HTTP error page fails the download with the status in the message,
+    // instead of streaming the error body into a cryptic tar error
+    try {
+        await download({ ...stubPack, id: 'notfound',
+            url: `http://127.0.0.1:${port}/no-such-file.tar.bz2` })
+        failures++
+        printerr('FAIL: an HTTP 404 should reject')
+    } catch (error) {
+        assert(/HTTP 404/.test(error.message),
+            `404 is reported as an HTTP status error (got: ${error.message})`)
+        assert(!GLib.file_test(packDir('notfound') + '.part', GLib.FileTest.EXISTS),
+            'no .part left behind after an HTTP error')
     }
 
     // cancelling from the first progress callback rejects mid-download
@@ -172,6 +205,23 @@ try {
             'no pack dir after a checksum failure')
     }
 
+    // a non-tarball body passes the download checks but fails the unpack:
+    // the pack dir created for it must not survive (sha256 skipped, so the
+    // checksum pass cannot be what rejects it)
+    GLib.file_set_contents(GLib.build_filenamev([www, 'notes.txt']),
+        'this is not a tarball')
+    try {
+        await download({ ...stubPack, id: 'nottar', sha256: null,
+            url: `http://127.0.0.1:${port}/notes.txt` })
+        failures++
+        printerr('FAIL: a non-tarball body should reject')
+    } catch {
+        assert(!GLib.file_test(packDir('nottar') + '.part', GLib.FileTest.EXISTS),
+            'no .part left behind after a failed unpack')
+        assert(!GLib.file_test(packDir('nottar'), GLib.FileTest.EXISTS),
+            'no pack dir after a failed unpack')
+    }
+
     // the same fixture downloaded as the real kokoro entry: the catalog
     // (which has a null sha256) picks it up
     await download({ ...kokoro, url: stubUrl })
@@ -186,12 +236,18 @@ try {
     assert(verifyPack(stubPack) === false, 'verifyPack false after delete')
     assert(deletePack('stub') === false, 'deleting again returns false')
 } finally {
-    server.force_exit()
+    if (server) {
+        server.force_exit()
+        // reap the killed server so no zombie is left behind
+        server.wait(null)
+    }
+    // the whole temp XDG tree goes away with this run, whatever happened
+    rmrf(Gio.File.new_for_path(tmp))
 }
 
-// let libsoup finish tearing down the connections left behind by the
-// failed and cancelled downloads before the process exits, so its
-// teardown messages don't leak into the test output
+// wait for libsoup to finish tearing down the connections left behind by
+// the failed and cancelled downloads: exiting too early otherwise trips
+// its "soup_message_queue_item_destroy" runtime check at process exit
 await new Promise(resolve =>
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250,
         () => (resolve(), GLib.SOURCE_REMOVE)))

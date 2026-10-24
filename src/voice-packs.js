@@ -114,11 +114,14 @@ const SIZE_CHUNK = 64 * 1024
 // then unpacks it into packDir(id) with --strip-components=1 (sherpa-onnx
 // archives carry a top-level directory, and the expected files must land
 // directly in packDir(id)). The download is verified before unpacking: the
-// server-reported Content-Length must match what we received, and a pinned
-// pack.sha256 is checked against the .part file with
-// GLib.compute_checksum_for_bytes. A failed or cancelled download leaves
-// nothing behind: the .part file is always removed, and the pack directory
-// too when the unpack step failed after creating it.
+// response must be 200 OK, the server-reported Content-Length must match
+// what we received, and a pinned pack.sha256 is checksummed incrementally
+// as the stream is read (no second read of the .part file, no whole-tarball
+// buffer in memory). After unpacking, the result is checked with
+// verifyPack so a weird layout fails loudly instead of installing a broken
+// pack. A failed or cancelled download leaves nothing behind: the .part
+// file is always removed, and the pack directory too when the unpack step
+// failed after creating it — tar is killed and reaped first.
 export const download = async (pack, onProgress = null, cancellable = null) => {
     const dir = packDir(pack.id)
     const part = Gio.File.new_for_path(`${dir}.part`)
@@ -130,16 +133,27 @@ export const download = async (pack, onProgress = null, cancellable = null) => {
     } catch (error) {
         if (error.code !== Gio.IOErrorEnum.EXISTS) throw error
     }
-    const out = part.replace(null, false, Gio.FileCreateFlags.NONE, null)
+    let out = null
+    let unpack = null
     let unpacking = false
     let body = null
     try {
+        out = part.replace(null, false, Gio.FileCreateFlags.NONE, null)
         const message = Soup.Message.new('GET', pack.url)
         if (message === null)
             throw new Error(`invalid pack URL: ${pack.url}`)
         body = await gioAsync(soupSession, 'send_async', 'send_finish',
             message, GLib.PRIORITY_DEFAULT, cancellable)
+        // error pages stream a body that would only fail later as a
+        // cryptic tar error: reject here instead
+        const status = message.get_status()
+        if (status !== Soup.Status.OK)
+            throw new Error(`HTTP ${status} for ${pack.url}`)
+        // soup_message_headers_get_content_length is deprecated upstream,
+        // but still present in libsoup 3.6.6
         const total = message.get_response_headers().get_content_length()
+        const sum = pack.sha256
+            ? new GLib.Checksum(GLib.ChecksumType.SHA256) : null
         let received = 0
         let bytes
         while ((bytes = await gioAsync(body, 'read_bytes_async',
@@ -147,6 +161,7 @@ export const download = async (pack, onProgress = null, cancellable = null) => {
             cancellable)).get_size() > 0) {
             await gioAsync(out, 'write_bytes_async', 'write_bytes_finish',
                 bytes, GLib.PRIORITY_DEFAULT, cancellable)
+            sum?.update(bytes.get_data())
             received += bytes.get_size()
             if (onProgress && total > 0)
                 onProgress(Math.min(received / total, 1))
@@ -155,10 +170,9 @@ export const download = async (pack, onProgress = null, cancellable = null) => {
             throw new Error(`size mismatch for ${pack.id}: ` +
                 `got ${received} of ${total} bytes`)
         await out.close(null)
-        if (pack.sha256) {
-            const [data] = part.load_bytes(null)
-            const digest =
-                GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256, data)
+        out = null
+        if (sum) {
+            const digest = sum.get_string()
             if (digest.toLowerCase() !== pack.sha256.toLowerCase())
                 throw new Error(`checksum mismatch for ${pack.id}: ` +
                     `got ${digest}, expected ${pack.sha256}`)
@@ -169,15 +183,28 @@ export const download = async (pack, onProgress = null, cancellable = null) => {
             if (error.code !== Gio.IOErrorEnum.EXISTS) throw error
         }
         unpacking = true
-        const unpack = Gio.Subprocess.new(
+        unpack = Gio.Subprocess.new(
             ['tar', '-xjf', part.get_path(), '--strip-components=1',
-                '-C', dir], Gio.SubprocessFlags.NONE)
+                '-C', dir],
+            Gio.SubprocessFlags.STDOUT_SILENCE |
+            Gio.SubprocessFlags.STDERR_SILENCE)
         await gioAsync(unpack, 'wait_check_async', 'wait_check_finish',
             cancellable)
+        // a weird layout must fail loudly here, not install a broken pack
+        if (!verifyPack(pack))
+            throw new Error(`unpacked ${pack.id} is missing expected files`)
         unpacking = false
         // success: the .part file is no longer needed
-        return part.delete(null)
+        part.delete(null)
     } catch (error) {
+        // a cancelled wait leaves tar running: stop it before deleting the
+        // files it may still be extracting
+        if (unpack) {
+            unpack.force_exit()
+            try {
+                await gioAsync(unpack, 'wait_async', 'wait_finish', null)
+            } catch { /* nothing left to reap */ }
+        }
         try { part.delete(null) } catch { /* nothing to remove */ }
         if (unpacking && !preexisting) {
             try {
@@ -187,7 +214,7 @@ export const download = async (pack, onProgress = null, cancellable = null) => {
         throw error
     } finally {
         try { body?.close(null) } catch { /* ignore */ }
-        try { out.close(null) } catch { /* ignore */ }
+        try { out?.close(null) } catch { /* ignore */ }
     }
 }
 
