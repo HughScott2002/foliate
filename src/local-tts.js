@@ -79,8 +79,10 @@ const reap = proc => {
 
 // duration in seconds from the RIFF header: data chunk size (bytes 40-44,
 // little-endian) over the byte rate (sampleRate * channels * bits / 8) —
-// exact for canonical and extra-chunk RIFFs, unlike the RIFF size at
-// bytes 4-8 which carries the 44-byte header bias
+// unlike the RIFF size at bytes 4-8 this carries no 44-byte header bias.
+// The 'data' tag is validated at its canonical offset (bytes 36-40): a
+// non-canonical chunk layout fails loudly instead of returning a
+// plausible-looking wrong duration.
 const parseWavDuration = path => {
     const stream = Gio.File.new_for_path(path).read(null)
     try {
@@ -90,6 +92,8 @@ const parseWavDuration = path => {
         const view = new DataView(data.buffer, data.byteOffset, data.length)
         if (view.getUint32(0, false) !== 0x52494646) // 'RIFF'
             throw new Error(`not a WAV file: ${path}`)
+        if (view.getUint32(36, false) !== 0x64617461) // 'data'
+            throw new Error(`unsupported wav layout: ${path}`)
         const byteRate = view.getUint32(24, true) * view.getUint16(22, true) *
             view.getUint16(34, true) / 8
         if (!byteRate)
@@ -228,18 +232,35 @@ export class LocalTTS {
                 throw new Error(['synthesis failed', error.message,
                     stderr].filter(Boolean).join(': '))
             }
-            // success still drains stderr so the pipe fd is closed
-            const stderr = await stderrPromise
-            if (!GLib.file_test(partPath, GLib.FileTest.IS_REGULAR)) {
-                try { partFile.delete(null) } catch { /* nothing staged */ }
-                throw new Error(['engine wrote no output', program, stderr]
-                    .filter(Boolean).join(': '))
+            // clean exit: drain stderr (a drain rejection must not skip
+            // cleanup), then validate BEFORE publishing — a truncated
+            // exit-0 file must never land at the cache-visible path
+            let published = false
+            try {
+                const stderr = await stderrPromise
+                if (!GLib.file_test(partPath, GLib.FileTest.IS_REGULAR))
+                    throw new Error(['engine wrote no output', program,
+                        stderr].filter(Boolean).join(': '))
+                // parse before publishing: a file that fails wav
+                // validation is deleted with the staging path, so no
+                // poisoned entry is ever visible to cache hits
+                const duration = parseWavDuration(partPath)
+                moveFile(partPath, wavPath)
+                published = true
+                return { wavPath, duration }
+            } finally {
+                // nothing staged survives a failure; after a successful
+                // move the delete is a harmless no-op
+                if (!published)
+                    try { partFile.delete(null) } catch {
+                        /* nothing staged */
+                    }
             }
-            // clean exit: publish the wav at its cache-visible path
-            moveFile(partPath, wavPath)
-            return { wavPath, duration: parseWavDuration(wavPath) }
         } finally {
             if (this.#proc === proc) this.#proc = null
+            // the stopped identity was consumed by the failure path above;
+            // clear it here so it cannot pin the proc and its stderr fd
+            if (this.#stoppedProc === proc) this.#stoppedProc = null
         }
     }
 

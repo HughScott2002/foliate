@@ -132,8 +132,9 @@ echo 'engine exploded' >&2
 exit 3
 `)
 
-// fake engine that writes a complete wav and THEN fails: the crash path
-// must leave neither the .part staging file nor a cache-visible wav
+// fake engine that writes a complete wav and THEN fails: it records the
+// path it wrote (it sees no args.last), and the test proves the staging
+// file and the cache-visible path are both gone afterwards
 const crashesAfterWrite = writeScript('fake-crash-after-write.sh', `#!/bin/sh
 dir=$(dirname "$0")
 for arg; do
@@ -143,6 +144,7 @@ for arg; do
 done
 cat "${headerPath}" > "$wav"
 head -c 32000 /dev/zero >> "$wav"
+echo "$wav" > "$dir/crash.out"
 echo 'wrote it, then died' >&2
 exit 1
 `)
@@ -336,6 +338,12 @@ try {
 // --- a crash AFTER the wav is written must not look like a cache hit ---
 
 GLib.setenv('FOLIATE_TTS_CMD', crashesAfterWrite, true)
+// clear markers from earlier runs so the assertions below cannot pass on
+// stale state
+try {
+    Gio.File.new_for_path(
+        GLib.build_filenamev([fakeDir, 'crash.out'])).delete(null)
+} catch { /* no marker yet */ }
 try {
     await tts.synth('Crash after write.', kokoroPack)
     failures++
@@ -344,14 +352,26 @@ try {
     assert(/synthesis failed/.test(error.message) && /died/.test(error.message),
         `crash-after-write rejects with the engine noise (got: ${error.message})`)
 }
-const crashPart = argsLast()
-    .find(arg => arg.startsWith('--output-filename='))
-    ?.slice('--output-filename='.length)
-assert(crashPart, 'the crashed engine was invoked with an output path')
-assert(!GLib.file_test(crashPart, GLib.FileTest.EXISTS),
-    'a crashed engine leaves no .part staging file behind')
-assert(!GLib.file_test(crashPart.replace(/\.part$/, ''), GLib.FileTest.EXISTS),
+const crashWav = readTextOr(
+    GLib.build_filenamev([fakeDir, 'crash.out']), '').trim()
+assert(crashWav, 'the crashed engine recorded its output path')
+assert(!GLib.file_test(crashWav, GLib.FileTest.EXISTS),
+    'a crashed engine leaves no staging file at its output path')
+assert(!GLib.file_test(crashWav.replace(/\.part$/, ''), GLib.FileTest.EXISTS),
     'a crashed engine leaves no cache-visible wav behind')
+// sweep the whole cache dir: nothing else may be lingering as .part
+const lingering = []
+{
+    const children = Gio.File.new_for_path(cacheA).enumerate_children(
+        'standard::name', Gio.FileQueryInfoFlags.NONE, null)
+    let name
+    while ((name = children.next_file(null)) != null)
+        if (name.get_name().endsWith('.part'))
+            lingering.push(name.get_name())
+    children.close(null)
+}
+assert(lingering.length === 0,
+    `no .part staging files linger in the cache (got: ${lingering.join(', ')})`)
 GLib.setenv('FOLIATE_TTS_CMD', writer, true)
 
 // --- one live synth at a time, killed on cancel and on stop ---
