@@ -2,6 +2,11 @@ import { exit } from 'system'
 import GLib from 'gi://GLib'
 import Gio from 'gi://Gio'
 
+// Keep test state out of the real ~/.local/share/foliate: repoint
+// XDG_DATA_HOME at a temp dir before any packDir() call (resolution is lazy
+// inside the module, so this takes effect).
+GLib.setenv('XDG_DATA_HOME', GLib.dir_make_tmp(null), true)
+
 import {
     getPacks,
     packDir,
@@ -32,17 +37,35 @@ assert(packs.find(p => p.id === 'supertonic').url === supertonic,
 assert(packs.find(p => p.id === 'piper').url === piper, 'piper url is pinned')
 assert(packs.find(p => p.id === 'kokoro').languages.join() === 'en,zh',
     'kokoro languages are en, zh')
+assert(packs.find(p => p.id === 'supertonic').languages.length === 31,
+    'supertonic lists 31 languages')
+assert(['en', 'zh', 'fr'].every(l =>
+    packs.find(p => p.id === 'supertonic').languages.includes(l)),
+'supertonic languages include en, zh, fr')
 assert(packs.find(p => p.id === 'kokoro').sid === 23, 'kokoro default sid is 23')
 assert(packs.find(p => p.id === 'supertonic').sid === 0,
     'supertonic default sid is 0')
-assert(packs.find(p => p.id === 'supertonic').numLanguages === 31,
-    'supertonic reports 31 languages')
-assert(packs.find(p => p.id === 'piper').sizeMB === 79, 'piper sizeMB is 79')
-assert(packs.every(p => p.sha256 === null), 'sha256 placeholders are null')
+assert(packs.find(p => p.id === 'piper').sizeMB === 64, 'piper sizeMB is 64')
+assert(packs.every(p => p.sha256 === null || /^[0-9a-f]{64}$/i.test(p.sha256)),
+    'sha256 is null or a 64-char hex digest')
+assert(typeof packs.find(p => p.id === 'kokoro').default === 'boolean',
+    'kokoro has a default marker')
+assert(JSON.stringify(packs.filter(p => p.default).map(p => p.id))
+        === JSON.stringify(['kokoro']),
+'kokoro is the only default pack')
 assert(packs.every(p => typeof p.label === 'string'), 'every pack has a label')
 assert(packs.every(p => typeof p.sample === 'string'), 'every pack has a sample')
 assert(packs.every(p => Array.isArray(p.expectedFiles) && p.expectedFiles.length),
     'every pack lists expected files')
+
+// runtime data coverage
+assert(packs.find(p => p.id === 'kokoro').expectedFiles.includes('model.int8.onnx'),
+    'kokoro expects model.int8.onnx')
+assert(!packs.find(p => p.id === 'kokoro').expectedFiles.includes('model.onnx'),
+    'kokoro does not expect model.onnx')
+assert(['kokoro', 'piper'].every(id =>
+    packs.find(p => p.id === id).expectedFiles.includes('espeak-ng-data')),
+'espeak-ng-data is required by kokoro and piper')
 
 // paths
 assert(packDir('kokoro').endsWith('/foliate/voices/kokoro'),
@@ -55,26 +78,31 @@ assert(Array.isArray(installed), 'getInstalledPacks() returns an array')
 const knownIds = packs.map(p => p.id)
 assert(installed.every(p => knownIds.includes(p.id)),
     'getInstalledPacks() only lists known packs')
+assert(!installed.some(p => p.id === 'kokoro'),
+    'kokoro not reported installed before download')
 
-// verifyPack on a pack that is not installed
-const notInstalled = !GLib.file_test(packDir('kokoro'), GLib.FileTest.IS_DIR)
-assert(notInstalled ? verifyPack(packs[0]) === false : true,
-    'verifyPack returns false when pack is absent')
-
-// full install -> verify -> delete cycle, only when safe (dir absent)
-if (notInstalled) {
-    const dir = Gio.File.new_for_path(packDir('kokoro'))
-    dir.make_directory_with_parents(null)
-    for (const name of packs[0].expectedFiles)
-        dir.get_child(name).create(Gio.FileCreateFlags.NONE, null).close(null)
-    assert(verifyPack(packs[0]) === true, 'verifyPack true with all files present')
-    assert(getInstalledPacks().some(p => p.id === 'kokoro'),
-        'getInstalledPacks() sees the installed pack')
-    assert(deletePack('kokoro') === true, 'deletePack removes the installed pack')
-    assert(verifyPack(packs[0]) === false, 'verifyPack false again after delete')
-} else {
-    printerr('skipping install cycle: kokoro pack already exists')
+// full install -> verify -> delete cycle (runs in the temp XDG_DATA_HOME)
+const kokoroPack = packs[0]
+const dir = Gio.File.new_for_path(packDir('kokoro'))
+dir.make_directory_with_parents(null)
+// 'dict' and 'espeak-ng-data' ship as directories in the tarball
+const DIRS = new Set(['espeak-ng-data', 'dict'])
+for (const name of kokoroPack.expectedFiles) {
+    if (DIRS.has(name)) dir.get_child(name).make_directory(null)
+    else dir.get_child(name).create(Gio.FileCreateFlags.NONE, null).close(null)
 }
+assert(verifyPack(kokoroPack) === true, 'verifyPack true with all files present')
+assert(getInstalledPacks().some(p => p.id === 'kokoro'),
+    'getInstalledPacks() sees the installed pack')
+
+// an empty dir must not pass verifyPack (expected files make it real)
+const emptyDir = Gio.File.new_for_path(packDir('piper'))
+emptyDir.make_directory_with_parents(null)
+assert(verifyPack(packs.find(p => p.id === 'piper')) === false,
+    'verifyPack false for an empty pack dir')
+
+assert(deletePack('kokoro') === true, 'deletePack removes the installed pack')
+assert(verifyPack(kokoroPack) === false, 'verifyPack false again after delete')
 
 // deleting a missing pack must not throw
 assert(deletePack('not-a-real-pack') === false,
@@ -82,7 +110,7 @@ assert(deletePack('not-a-real-pack') === false,
 
 // download is a stub in Task 1
 try {
-    await download(packs[0])
+    await download(kokoroPack)
     failures++
     printerr('FAIL: download() should reject')
 } catch (e) {

@@ -17,6 +17,7 @@
     <file>toc.js</file>
     <file>tts.js</file>
     <file>utils.js</file>
+    <file>voice-packs.js</file>
     <file>webview.js</file>
     <file>ui/annotation-popover.ui</file>
     <file>ui/annotation-row.ui</file>
