@@ -25,7 +25,6 @@ export const getPacks = () => [{
     url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-int8-multi-lang-v1_1.tar.bz2',
     sha256: 'a1e94694776049035c4f2c6529f003aaece993c76aae9a78995831c3c4dcafc6',
     sample: 'Hello! This is a sample of the Kokoro voice.',
-    default: true,
     expectedFiles: [
         'model.int8.onnx',
         'voices.bin',
@@ -48,6 +47,7 @@ export const getPacks = () => [{
     sid: 0,
     url: 'https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2',
     sha256: '82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427',
+    default: true,
     sample: 'Hello! This is a sample of the Supertonic voice.',
     expectedFiles: [
         'text_encoder.int8.onnx',

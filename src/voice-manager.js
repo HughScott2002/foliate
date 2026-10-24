@@ -61,7 +61,8 @@ export const VoiceManagerDialog = GObject.registerClass({
             })
             preview.connect('clicked', () => this.#preview(item))
             remove.connect('clicked', () => this.#confirmRemove(item))
-            if (pack.id === selected || (!selected && pack.languages.includes(language)))
+            if (pack.id === selected || (!selected && (
+                pack.languages.includes(language) || pack.default)))
                 button.add_css_class('suggested-action')
         }
         toolbar.content = new Gtk.ScrolledWindow({ child: content, hscrollbar_policy: Gtk.PolicyType.NEVER })

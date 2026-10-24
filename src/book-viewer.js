@@ -867,7 +867,8 @@ export const BookViewer = GObject.registerClass({
         const saved = this.#data?.storage.get('tts-voice-pack')
         tts.setPack(getPacks().find(pack => pack.id === saved)
             ?? getInstalledPacks().find(pack => pack.languages.includes(primary))
-            ?? pickPackForLanguage(primary))
+            ?? pickPackForLanguage(primary)
+            ?? getPacks().find(pack => pack.default))
     }
     #showVoices(startAfterSelection = false) {
         if (this.#voiceManager) return

@@ -48,11 +48,11 @@ assert(packs.find(p => p.id === 'supertonic').sid === 0,
 assert(packs.find(p => p.id === 'piper').sizeMB === 64, 'piper sizeMB is 64')
 assert(packs.every(p => p.sha256 === null || /^[0-9a-f]{64}$/i.test(p.sha256)),
     'sha256 is null or a 64-char hex digest')
-assert(typeof packs.find(p => p.id === 'kokoro').default === 'boolean',
-    'kokoro has a default marker')
+assert(typeof packs.find(p => p.id === 'supertonic').default === 'boolean',
+    'supertonic has a default marker')
 assert(JSON.stringify(packs.filter(p => p.default).map(p => p.id))
-        === JSON.stringify(['kokoro']),
-'kokoro is the only default pack')
+        === JSON.stringify(['supertonic']),
+'supertonic is the only default pack')
 assert(packs.every(p => typeof p.label === 'string'), 'every pack has a label')
 assert(packs.every(p => typeof p.sample === 'string'), 'every pack has a sample')
 assert(packs.every(p => Array.isArray(p.expectedFiles) && p.expectedFiles.length),
