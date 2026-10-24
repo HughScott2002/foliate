@@ -225,8 +225,19 @@ export class LocalTTS {
                 // mistake for a cache hit
                 proc.force_exit()
                 await reap(proc)
-                const stderr = await stderrPromise
-                try { partFile.delete(null) } catch { /* nothing staged */ }
+                let stderr = null
+                try {
+                    stderr = await stderrPromise
+                } catch (drainError) {
+                    // a drain rejection must not skip the .part cleanup:
+                    // capture it into the report instead
+                    stderr = `stderr unreadable: ${drainError?.message ??
+                        drainError}`
+                } finally {
+                    try {
+                        partFile.delete(null)
+                    } catch { /* nothing staged */ }
+                }
                 if (this.#stoppedProc === proc)
                     throw new Error('synthesis stopped')
                 throw new Error(['synthesis failed', error.message,
