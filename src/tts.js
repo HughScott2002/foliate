@@ -7,6 +7,7 @@ import { SSIPClient } from './speech.js'
 import { LocalTTS } from './local-tts.js'
 import { LocalTTSPlayer } from './local-tts-player.js'
 import { getInstalledPacks } from './voice-packs.js'
+import { normalizeSentence } from './tts-normalize.js'
 
 const ssip = new SSIPClient()
 
@@ -230,7 +231,8 @@ export const TTSBox = GObject.registerClass({
             if (generation !== this.#generation) return false
             const lang = (parsed.language || this.language).split('-')[0]
             for (const s of parsed.sentences)
-                buffer.push({ text: s.text, index: s.index, lang, seq: blk.seq })
+                buffer.push({ text: normalizeSentence(s.text),
+                    index: s.index, lang, seq: blk.seq })
             return true
         }
         if (initial) {

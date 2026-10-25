@@ -20,6 +20,7 @@
     <file>tts.js</file>
     <file>utils.js</file>
     <file>voice-packs.js</file>
+    <file>tts-normalize.js</file>
     <file>voice-daemon.js</file>
     <file>voice-manager.js</file>
     <file>webview.js</file>
