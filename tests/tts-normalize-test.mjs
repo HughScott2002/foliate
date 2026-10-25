@@ -52,6 +52,17 @@ check('No. 5', 'Number 5', 'No. before a digit is Number')
 // English rewrites are gated off for other languages
 check('Dr. Smith', 'Dr. Smith', 'abbreviations untouched in German', 'de')
 
+// --- English: shouted all-caps folded to sentence case ---
+check('SHOULD YOU SELL YOUR COMPANY?', 'Should you sell your company?',
+    'all-caps heading folded to sentence case')
+check('TYPES OF ACQUISITIONS', 'Types of acquisitions', 'all-caps heading, no punctuation')
+check('THE CEO SAID IT', 'The ceo said it', 'all-caps words are lowercased as a set')
+check('The CEO and the FBI said so', 'The CEO and the FBI said so',
+    'inline acronyms in normal prose are untouched')
+check('This Is Title Case', 'This Is Title Case', 'title case is left alone')
+check('I', 'I', 'a single letter is untouched')
+check('DAS IST EIN TITEL', 'DAS IST EIN TITEL', 'all-caps untouched in German', 'de')
+
 // --- English: symbols and numbers with units ---
 check('Tom & Jerry', 'Tom and Jerry', 'ampersand')
 check('section \u00A7 4', 'section section 4', 'section sign by glyph')

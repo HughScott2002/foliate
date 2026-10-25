@@ -12,9 +12,13 @@ import GLib from 'gi://GLib'
 import { exit } from 'system'
 
 const read = p => new TextDecoder().decode(Gio.File.new_for_path(p).load_contents(null)[1])
+// tts.js imports the roles module; when inlining sources into one module
+// script, the import must be dropped and the roles source included instead
+const stripStripperImport = src => src.replace(/^import\s+\{[^}]*\}\s+from\s+'\.\/dom-stripper\.js'\n/m, '')
 const sources = [
     read('src/foliate-js/text-walker.js'),
-    read('src/foliate-js/tts.js'),
+    read('src/foliate-js/dom-stripper.js'),
+    stripStripperImport(read('src/foliate-js/tts.js')),
     read('src/reader/tts.js'),
 ]
 

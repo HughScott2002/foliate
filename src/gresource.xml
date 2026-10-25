@@ -68,6 +68,7 @@
     <file>foliate-js/quote-image.js</file>
     <file>foliate-js/search.js</file>
     <file>foliate-js/text-walker.js</file>
+    <file>foliate-js/dom-stripper.js</file>
     <file>foliate-js/tts.js</file>
     <file>foliate-js/uri-template.js</file>
     <file>foliate-js/view.js</file>

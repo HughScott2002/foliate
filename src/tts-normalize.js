@@ -65,12 +65,29 @@ const cleanUniversal = text => {
     return s
 }
 
+// A whole sentence in CAPS (a shouted heading such as the book's
+// "SHOULD YOU SELL YOUR COMPANY?") makes neural engines over-pronounce or
+// misread it (Supertonic renders all-caps differently from title case).
+// Fold it to sentence case. Only when EVERY letter is uppercase, so inline
+// acronyms in normal prose (CEO, FBI) are never touched; scripts without
+// case (CJK) and letter-free strings are left alone. CAVEAT: an acronym
+// inside an all-caps sentence is lowercased too (we cannot tell it apart);
+// the FST backend will handle acronyms properly later.
+const foldAllCaps = text => {
+    const letters = text.replace(/[^\p{L}]/gu, '')
+    if (letters.length < 2) return text
+    if (letters !== letters.toUpperCase()) return text   // some lowercase present
+    if (letters === letters.toLowerCase()) return text    // no case (CJK, etc.)
+    const lower = text.toLowerCase()
+    return lower.replace(/\p{L}/u, c => c.toUpperCase())  // first letter back up
+}
+
 // English-specific rewrites (symbols, currency/percent, abbreviations).
 // NOTE: currency/percent are position-fragile on purpose ("$5 million"
 // becomes "5 dollars million"): they are a conservative stopgap until the
 // FST backend replaces them.
 const cleanEnglish = text => {
-    let s = text
+    let s = foldAllCaps(text)
     for (const [re, out] of SYMBOLS) s = s.replace(re, out)
     s = s.replace(/\$\s?(\d[\d,.]*)/g, '$1 dollars')
     s = s.replace(/(\d)\s*%/g, '$1 percent')
