@@ -715,7 +715,10 @@ export const BookViewer = GObject.registerClass({
 
         // TTS
         utils.connect(this._navbar.tts_box, {
-            'init': () => this._view.initTTS(this._navbar.tts_box.backend === 'local'),
+            'init': () => this._view.initTTS({
+                local: this._navbar.tts_box.backend === 'local',
+                readNotes: this._navbar.tts_box.readFootnotes,
+            }),
             'start': () => this._view.ttsStart(),
             'resume': () => this._view.ttsResume(),
             'backward': () => this._view.ttsPrev(),

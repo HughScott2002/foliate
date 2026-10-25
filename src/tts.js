@@ -40,7 +40,7 @@ export const TTSBox = GObject.registerClass({
         'tts-rate-scale', 'tts-pitch-scale',
         'media-buttons', 'play-button',
         'system-controls', 'local-controls', 'backend-dropdown',
-        'local-rate', 'voice-label', 'manage-voices-button',
+        'local-rate', 'voice-label', 'manage-voices-button', 'read-footnotes',
     ],
 }, class extends Gtk.Box {
     #state = 'stopped'
@@ -72,6 +72,9 @@ export const TTSBox = GObject.registerClass({
         this._local_rate.connect('value-changed', spin =>
             this.#player.setRate(spin.value))
         this._manage_voices_button.connect('clicked', () => this.emit('voices-requested', false))
+        this._read_footnotes.active = this.#settings?.get_boolean('tts-read-footnotes') ?? false
+        this._read_footnotes.connect('toggled', button =>
+            this.#settings?.set_boolean('tts-read-footnotes', button.active))
         // text normalization is a stable seam: 'rules' (built-in) or 'none'
         // (an external normalizer, e.g. a compiled FST, does it downstream).
         // Callers only ever use normalizeText(); the backend can change
@@ -80,6 +83,7 @@ export const TTSBox = GObject.registerClass({
         this.#syncBackend()
     }
     get backend() { return this.#backend }
+    get readFootnotes() { return this._read_footnotes.active }
     get rateAdjustment() { return this._local_rate.adjustment }
     #syncBackend() {
         this._system_controls.visible = this.backend === 'speechd'

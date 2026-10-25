@@ -52,6 +52,8 @@ webView.load_html(`<html lang="en" xmlns:epub="http://www.idpf.org/2007/ops"><bo
 <p>O'Reilly style<span data-type="noteref">7</span> marker.</p>
 <div data-type="footnotes"><p data-type="footnote">Atlas footnote body.</p></div>
 <p>Paged <span data-type="pagebreak">88</span> again.</p>
+<table><tbody><tr><th>Header cell</th></tr><tr><td>Data cell value</td></tr></tbody></table>
+<figure><img alt="A picture"/><figcaption>Figure caption text</figcaption></figure>
 </main>
 </body>
 <script type="module">
@@ -75,6 +77,17 @@ try {
     check(isSkippable(oreilly), 'data-type noteref not skippable')
     check(isSkippable(document.querySelector('[data-type="footnotes"]')),
         'data-type footnotes container not skippable')
+    // structural roles default to skipped (a table read cell-by-cell is soup)
+    check(isSkippable(document.querySelector('table')), 'table not skippable by default')
+    check(isSkippable(document.querySelector('figure')), 'figure not skippable by default')
+    // the notes toggle: skipSetFor drops the note roles when reading notes
+    check(skipSetFor({}).has('footnote'), 'footnote skipped by default')
+    check(!skipSetFor({ readNotes: true }).has('footnote'),
+        'readNotes must un-skip footnotes')
+    check(skipSetFor({ readNotes: true }).has('noteref'),
+        'readNotes must NOT un-skip the noteref marker')
+    check(skipSetFor({ readNotes: true }).has('pagebreak'),
+        'readNotes must NOT un-skip pagebreak labels')
     // a presentation role strips native semantics
     const probe = document.createElement('aside')
     probe.setAttribute('role', 'presentation')
@@ -111,6 +124,30 @@ try {
     check(!text.includes('Atlas footnote body'), 'data-type footnote was spoken: ' + JSON.stringify(text))
     check(!text.includes('7'), 'data-type noteref marker was spoken: ' + JSON.stringify(text))
     check(!text.includes('88'), 'data-type pagebreak label was spoken: ' + JSON.stringify(text))
+    check(!text.includes('Data cell value') && !text.includes('Header cell'),
+        'table content was spoken: ' + JSON.stringify(text))
+    check(!text.includes('Figure caption text'), 'figure caption was spoken: ' + JSON.stringify(text))
+
+    // "read notes" on: footnotes ARE spoken, the noteref marker still is not
+    const speak = readNotes => {
+        const t2 = new TTS(document, textWalker, () => {}, 'sentence', { readNotes })
+        const out = []
+        for (let i = 0; i < 40; i++) {
+            const ssml = t2.next()
+            if (typeof ssml !== 'string') break
+            for (const s of parseSSML(ssml).sentences) out.push(s.text)
+        }
+        return out.join(' ')
+    }
+    const withNotes = speak(true)
+    check(withNotes.includes('Sneaky footnote words'),
+        'readNotes did not speak the footnote: ' + JSON.stringify(withNotes))
+    check(withNotes.includes('Atlas footnote body'),
+        'readNotes did not speak the data-type footnote: ' + JSON.stringify(withNotes))
+    check(!/\\b1\\b/.test(withNotes.replace('Alpha beta', '')) && !withNotes.includes(' 99'),
+        'readNotes still spoke a noteref marker')
+    check(!withNotes.includes('Data cell value'),
+        'readNotes spoke table content: ' + JSON.stringify(withNotes))
     window.webkit.messageHandlers.result.postMessage(JSON.stringify({
         passed: true, message: 'Narration DOM stripper (skippable roles) tests passed',
     }))

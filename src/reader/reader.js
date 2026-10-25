@@ -295,16 +295,22 @@ class Reader {
     // consumed by ttsStart after initTTS has run (so the block snapshot is
     // taken after the map is cleared, not before)
     #pendingRange = null
-    async initTTS(local = false) {
+    // whether footnotes/endnotes are read (the "read notes" preference),
+    // carried across section changes so a boundary never resets it
+    readNotes = false
+    async initTTS(options = {}) {
+        const local = typeof options === 'boolean' ? options : (options.local ?? false)
+        const readNotes = typeof options === 'boolean' ? false : (options.readNotes ?? false)
         if (this.localNarration !== local) this.view.tts = null
         this.localNarration = local
+        this.readNotes = readNotes
         this.#rangeMap.clear()
         this.#blockSeq = -1
         // local: capture each block's ranges on demand (applied in ttsSetMark)
         // speechd: keep the default scroll-to-anchor highlight callback
         await this.view.initTTS(local ? 'sentence' : 'word', local
             ? range => { this.#capturedRange = range }
-            : undefined)
+            : undefined, { readNotes })
     }
     // Advance the iterator (next/prev/start/from a range), then snapshot the
     // highlight range of every sentence in the fetched block.
@@ -376,7 +382,7 @@ class Reader {
             await new Promise(resolve => setTimeout(resolve, 25))
         }
         if (this.view.renderer.getContents()[0]?.index !== next) return false
-        await this.initTTS(this.localNarration)
+        await this.initTTS({ local: this.localNarration, readNotes: this.readNotes })
         return true
     }
     setAppearance({ style, layout, autohideCursor }) {
@@ -522,7 +528,7 @@ class Reader {
                 case 'speak-from-here':
                 case 'speak-from-here-local': {
                     const local = action === 'speak-from-here-local'
-                    this.initTTS(local).then(() => {
+                    this.initTTS({ local, readNotes: this.readNotes }).then(() => {
                         // local: hand the range to ttsStart so the starting
                         // block is fetched (and its ranges snapshotted)
                         // AFTER the run's init clears the map. speechd: the

@@ -59,6 +59,13 @@
           </child>
         </object>
       </child>
+      <child>
+        <object class="GtkCheckButton" id="read-footnotes">
+          <property name="label" translatable="yes">Read footnotes and endnotes</property>
+          <property name="tooltip-text" translatable="yes">Include footnotes and endnotes in narration (off: main text only)</property>
+          <property name="halign">start</property>
+        </object>
+      </child>
     </object>
   </child>
   <child>
