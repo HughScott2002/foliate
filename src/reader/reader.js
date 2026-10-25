@@ -284,21 +284,62 @@ class Reader {
         this.sectionFractions = this.view.getSectionFractions()
     }
     narrationHighlight = new NarrationHighlight()
+    // Highlight ranges snapshotted per fetched block (seq -> mark -> Range).
+    // Lookahead advances the iterator past the sentence being read, which
+    // overwrites foliate-js's internal mark map; snapshotting at fetch time
+    // keeps highlighting a sentence independent of where the iterator is.
+    #rangeMap = new Map()
+    #blockSeq = -1
+    #capturedRange = null
     async initTTS(local = false) {
         if (this.localNarration !== local) this.view.tts = null
         this.localNarration = local
-        await this.view.initTTS(local ? 'sentence' : 'word', local ? range => {
-            this.view.renderer.scrollToAnchor(range, true)
-            this.narrationHighlight.show(range)
-        } : undefined)
+        this.#rangeMap.clear()
+        this.#blockSeq = -1
+        // local: capture each block's ranges on demand (applied in ttsSetMark)
+        // speechd: keep the default scroll-to-anchor highlight callback
+        await this.view.initTTS(local ? 'sentence' : 'word', local
+            ? range => { this.#capturedRange = range }
+            : undefined)
+    }
+    // Advance the iterator (next/prev/start/from a range), then snapshot the
+    // highlight range of every sentence in the fetched block.
+    #fetchBlock(mode, range) {
+        const ssml = mode === 'prev' ? this.view.tts.prev()
+            : mode === 'start'
+                ? (range ? this.view.tts.from(range) : this.view.tts.start())
+                : this.view.tts.next()
+        if (!ssml) return null
+        const seq = ++this.#blockSeq
+        const marks = new Map()
+        for (const s of parseSSML(ssml).sentences) {
+            this.#capturedRange = null
+            this.view.tts.setMark(s.index)
+            if (this.#capturedRange) marks.set(String(s.index), this.#capturedRange)
+        }
+        this.#rangeMap.set(seq, marks)
+        return { ssml, seq }
     }
     ttsStart() {
-        const range = this.view.lastLocation?.range
-        return this.localNarration && range ? this.view.tts.from(range)
-            : this.view.tts.start()
+        if (!this.localNarration) return this.view.tts.start()
+        return this.#fetchBlock('start', this.view.lastLocation?.range)
     }
+    ttsNext() { return this.localNarration ? this.#fetchBlock('next') : this.view.tts.next() }
+    ttsPrev() { return this.localNarration ? this.#fetchBlock('prev') : this.view.tts.prev() }
     ttsParse(ssml) { return parseSSML(ssml) }
     ttsClear() { this.narrationHighlight.clear() }
+    // local passes {seq, mark}; speechd passes a bare mark
+    ttsSetMark(x) {
+        if (x && typeof x === 'object') {
+            const range = this.#rangeMap.get(x.seq)?.get(String(x.mark))
+            if (range) {
+                this.view.renderer.scrollToAnchor(range, true)
+                this.narrationHighlight.show(range)
+            }
+            return
+        }
+        this.view.tts.setMark(x)
+    }
     async ttsNextSection() {
         const index = this.view.renderer.getContents()[0]?.index
         if (index == null) return false
@@ -454,7 +495,9 @@ class Reader {
                 case 'speak-from-here-local':
                     this.initTTS(action === 'speak-from-here-local').then(() => emit({
                         type: 'selection', action: 'speak-from-here',
-                        ssml: this.view.tts.from(range),
+                        ...(action === 'speak-from-here-local'
+                            ? this.#fetchBlock('start', range)
+                            : { ssml: this.view.tts.from(range) }),
                     }))
                     break
             }

@@ -198,6 +198,9 @@ export class LocalTTS {
         // and fall back to the one-shot CLI engine if it is not (or failed)
         const daemon = getVoiceDaemon()
         if (daemon.running && !this.#proc) {
+            // the cache dir may not exist yet on a fresh session; the
+            // daemon writes the wav at partPath and will not create it
+            GLib.mkdir_with_parents(this.#cacheDir, 0o755)
             const partPath = `${wavPath}.part`
             const partFile = Gio.File.new_for_path(partPath)
             try {

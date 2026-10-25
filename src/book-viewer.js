@@ -404,10 +404,10 @@ GObject.registerClass({
     print() { return this.#exec('reader.print') }
     initTTS(x) { return this.#exec('reader.initTTS', x) }
     ttsStart() { return this.#exec('reader.ttsStart') }
-    ttsPrev(x) { return this.#exec('reader.view.tts.prev', x) }
-    ttsNext(x) { return this.#exec('reader.view.tts.next', x) }
+    ttsPrev(x) { return this.#exec('reader.ttsPrev', x) }
+    ttsNext(x) { return this.#exec('reader.ttsNext', x) }
     ttsResume() { return this.#exec('reader.view.tts.resume') }
-    ttsSetMark(x) { return this.#exec('reader.view.tts.setMark', x) }
+    ttsSetMark(x) { return this.#exec('reader.ttsSetMark', x) }
     ttsParse(x) { return this.#exec('reader.ttsParse', x) }
     ttsClear() { return this.#exec('reader.ttsClear') }
     ttsNextSection() { return this.#exec('reader.ttsNextSection') }
@@ -722,7 +722,7 @@ export const BookViewer = GObject.registerClass({
             'forward': () => this._view.ttsNext(),
             'backward-paused': () => this._view.ttsPrev(true),
             'forward-paused': () => this._view.ttsNext(true),
-            'highlight': (_, mark) => this._view.ttsSetMark(mark),
+            'highlight': (_, x) => this._view.ttsSetMark(x),
             'parse': (_, ssml) => this._view.ttsParse(ssml),
             'clear-highlight': () => this._view.ttsClear().catch(e => console.debug(e)),
             'next-section': () => this._view.ttsNextSection(),
@@ -998,7 +998,7 @@ export const BookViewer = GObject.registerClass({
             utils.setClipboardText(result, this.root)
         }
         else if (action === 'speak-from-here')
-            this._navbar.tts_box.speak(payload.ssml)
+            this._navbar.tts_box.speak(payload)
     }
     #createOverlay({ index }) {
         if (!this.#data) return

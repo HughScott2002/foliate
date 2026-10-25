@@ -22,7 +22,7 @@ export const TTSBox = GObject.registerClass({
         'backward-paused': {},
         'forward-paused': {},
         'highlight': {
-            param_types: [GObject.TYPE_STRING],
+            param_types: [GObject.TYPE_JSOBJECT],
             return_type: GObject.TYPE_JSOBJECT,
         },
         'next-section': { return_type: GObject.TYPE_JSOBJECT },
@@ -174,7 +174,7 @@ export const TTSBox = GObject.registerClass({
             this.backend === 'local' ? e.message
             : _('Make sure Speech Dispatcher is installed and working on your system'))
     }
-    async #beginLocal(command, ssml) {
+    async #beginLocal(command, arg) {
         if (!this.pack || !getInstalledPacks().some(x => x.id === this.pack.id)) {
             this.emit('voices-requested', true)
             return
@@ -185,36 +185,63 @@ export const TTSBox = GObject.registerClass({
         try {
             await this.emit('init')
             if (generation !== this.#generation) return
-            const text = command ? await this.emit(command) : await ssml
+            const initial = command ? await this.emit(command) : arg
             if (generation !== this.#generation) return
-            await this.#speakLocal(text, generation)
+            await this.#speakStream(initial, generation)
         } catch (e) {
             if (generation === this.#generation) this.error(e)
         }
     }
-    async #speakLocal(ssml, generation) {
-        if (!ssml) {
-            if (await this.emit('next-section')) {
-                if (generation !== this.#generation) return
-                ssml = await this.emit('forward')
-            }
-            if (!ssml) {
-                if (generation === this.#generation) this.stop()
-                return
-            }
+    // One continuous sentence stream across every block and section of the
+    // book. `source()` pulls the next sentence, fetching blocks from the
+    // reader as they are needed — but the player pulls it ahead of
+    // playback, so a block's sentences are already synthesized while the
+    // previous block is still being read aloud. When the current section is
+    // exhausted the source advances to the next section in place, so the
+    // boundary is seamless too.
+    //
+    // Each block carries a `seq`: the reader snapshots that block's
+    // highlight ranges under the same seq, so a sentence is highlighted from
+    // its own block's ranges even though lookahead has advanced the iterator.
+    async #speakStream(initial, generation) {
+        const buffer = []
+        const addBlock = async blk => {
+            const parsed = await this.emit('parse', blk.ssml)
+            if (generation !== this.#generation) return false
+            const lang = (parsed.language || this.language).split('-')[0]
+            for (const s of parsed.sentences)
+                buffer.push({ text: s.text, index: s.index, lang, seq: blk.seq })
+            return true
         }
-        if (generation !== this.#generation) return
-        const { sentences, language } = await this.emit('parse', ssml)
-        if (generation !== this.#generation) return
+        if (initial) {
+            const blk = typeof initial === 'string' ? { ssml: initial, seq: -1 } : initial
+            if (blk.ssml && !await addBlock(blk)) return
+        }
+        const source = async () => {
+            while (buffer.length === 0) {
+                if (generation !== this.#generation) return null
+                let blk = await this.emit('forward')
+                if (generation !== this.#generation) return null
+                if (!blk) {
+                    const advanced = await this.emit('next-section')
+                    if (generation !== this.#generation) return null
+                    if (!advanced) return null
+                    blk = await this.emit('forward')
+                    if (generation !== this.#generation || !blk) return null
+                }
+                if (!await addBlock(blk)) return null
+            }
+            return buffer.shift()
+        }
         let failed = false
-        await this.#player.play(sentences, {
+        await this.#player.playStream(source, {
             pack: this.pack,
-            lang: (language || this.language).split('-')[0],
             rate: this._local_rate.value,
-            onMark: mark => {
+            onMark: entry => {
                 if (this.state === 'paused') this.#player.pause()
                 if (generation === this.#generation)
-                    Promise.resolve(this.emit('highlight', String(mark)))
+                    Promise.resolve(this.emit('highlight',
+                        { seq: entry?.seq, mark: String(entry?.index) }))
                         .catch(e => {
                             if (generation === this.#generation) this.error(e)
                         })
@@ -224,10 +251,7 @@ export const TTSBox = GObject.registerClass({
                 if (generation === this.#generation) this.error(e)
             },
         })
-        if (!failed && generation === this.#generation) {
-            const next = await this.emit('forward')
-            if (generation === this.#generation) await this.#speakLocal(next, generation)
-        }
+        if (!failed && generation === this.#generation) this.stop()
     }
     kill() {
         ++this.#generation

@@ -12,6 +12,24 @@ const RATE_MIN = 0.75
 const RATE_MAX = 2.0
 const clampRate = rate => Math.min(RATE_MAX, Math.max(RATE_MIN, rate))
 
+// Synth-ahead window bounds: how many sentences beyond the one playing may
+// be scheduled (synthesized) at once. Bounded so the queue holds a fixed,
+// small number of sentences regardless of book length.
+const AHEAD_MIN = 1
+const AHEAD_MAX = 16
+const AHEAD_DEFAULT = 4
+const clampAhead = n => {
+    const v = Math.floor(n)
+    if (!Number.isFinite(v)) return AHEAD_DEFAULT
+    return Math.min(AHEAD_MAX, Math.max(AHEAD_MIN, v))
+}
+
+// Invariant checks are always on (TigerStyle): a violated invariant is a
+// bug, not a condition to recover from, so it throws.
+const invariant = (cond, msg) => {
+    if (!cond) throw new Error(`local-tts-player: ${msg}`)
+}
+
 // The error a session rejects with when its stop() is called: the queue
 // treats it as an ordinary stop, not a failure.
 const STOPPED = 'playback stopped'
@@ -213,6 +231,156 @@ export class LocalTTSPlayer {
             // teardown on every exit path: cancel the in-flight synth
             // and reap the engine before reporting, so a stop never
             // leaves pending synthesis behind it
+            run.dead = true
+            run.cancellable.cancel()
+            try {
+                await this.#tts.stopAll()
+            } catch { /* nothing left to reap */ }
+            if (this.#run === run) this.#run = null
+            releaseRun()
+            if (failure) onError?.(failure)
+            else onEnd?.(null)
+        }
+    }
+
+    // Play a *stream* of sentences: `source()` is an async function that
+    // returns the next `{text, index, lang}` or null when the book ends.
+    // Unlike play(), the source is pulled AHEAD of playback (up to
+    // `synthAhead` sentences beyond the one playing), so the sentences of
+    // the next block are fetched and synthesized while the current block
+    // is still being read aloud — no synthesis lands on the speaker's
+    // critical path at a paragraph or chapter boundary.
+    //
+    // Bounds (TigerStyle): the window is clamped to [AHEAD_MIN, AHEAD_MAX];
+    // `pending`/`entries` hold at most `ahead` sentences at once (each is
+    // released once its audio has played); every loop iteration either
+    // plays one sentence or ends the stream.
+    async playStream(source, {
+        pack, voice, rate, synthAhead = AHEAD_DEFAULT, onMark, onEnd, onError,
+    } = {}) {
+        invariant(typeof source === 'function', 'source must be a function')
+        while (this.#run) {
+            if (!this.#run.dead)
+                throw new Error('a playback is already in progress')
+            await this.#run.done
+        }
+        this.#rate = clampRate(rate ?? this.#rate)
+        this.#paused = false
+        let releaseRun
+        const run = {
+            session: null,
+            dead: false,
+            cancellable: new Gio.Cancellable(),
+            done: new Promise(resolve => { releaseRun = resolve }),
+        }
+        this.#run = run
+
+        const ahead = clampAhead(synthAhead)
+        invariant(ahead >= AHEAD_MIN && ahead <= AHEAD_MAX, 'ahead in bounds')
+
+        // Bounded state: at most `ahead` sentences are ever held. Both maps
+        // are pruned as each sentence finishes playing.
+        const pending = new Map()  // index -> {text, index, lang}
+        const entries = new Map()  // index -> synth promise
+        let chain = Promise.resolve()
+        let scheduled = -1 // highest index handed to the synth chain
+        let sourceDone = false
+        let failed = false
+        let failure = null
+
+        const schedule = index => {
+            invariant(!entries.has(index), 'index not scheduled twice')
+            const s = pending.get(index)
+            invariant(s !== undefined, 'sentence present before scheduling')
+            invariant(typeof s.text === 'string', 'sentence text is a string')
+            const entry = chain.then(async () => {
+                if (run.dead || failed) return { stopped: true }
+                try {
+                    const result = await this.#tts.synth(s.text, pack, {
+                        lang: s.lang,
+                        sid: voice ?? undefined,
+                        cancellable: run.cancellable,
+                    })
+                    invariant(result && typeof result.wavPath === 'string',
+                        'synth result has a wavPath')
+                    return run.dead || failed
+                        ? { stopped: true } : { result }
+                } catch (error) {
+                    failed = true
+                    return run.dead ? { stopped: true } : { error }
+                }
+            })
+            entries.set(index, entry)
+            chain = entry
+        }
+
+        // Pull sentences from the source until `target` is scheduled. Each
+        // source() call is one RPC + parse on the reader side. Never
+        // schedules beyond the window: `entries.size` stays <= ahead.
+        const fill = async target => {
+            invariant(target >= 0, 'fill target is non-negative')
+            invariant(entries.size <= ahead, 'window not exceeded before fill')
+            while (!run.dead && !sourceDone && scheduled < target) {
+                const s = await source()
+                if (run.dead) return
+                if (!s) { sourceDone = true; return }
+                invariant(typeof s.text === 'string', 'source sentence has text')
+                scheduled += 1
+                pending.set(scheduled, s)
+                schedule(scheduled)
+                invariant(entries.size <= ahead, 'window not exceeded after schedule')
+            }
+        }
+
+        try {
+            let i = 0
+            while (!run.dead) {
+                invariant(i >= 0, 'playback index non-negative')
+                await fill(i + ahead - 1)
+                if (run.dead) break
+                // fill either produced sentence i or exhausted the source
+                invariant(entries.has(i) || sourceDone,
+                    'fill produced i or ended the source')
+                const entry = entries.get(i)
+                if (!entry) break // source exhausted, nothing left to play
+                const { result, error, stopped } = await entry
+                if (stopped) break
+                if (error) {
+                    run.dead = true
+                    throw error
+                }
+                onMark?.(pending.get(i) ?? { index: i })
+                if (run.dead) break
+                const session = await this.#makeSession(result.wavPath, {
+                    rate: this.#rate,
+                })
+                invariant(session && session.done, 'session has a done promise')
+                run.session = session
+                if (run.dead) {
+                    session.stop?.()
+                    await session.done.catch(() => {})
+                    break
+                }
+                if (this.#paused) session.pause?.()
+                try {
+                    await session.done
+                } catch (error) {
+                    if (run.dead) break // stopped, not failed
+                    run.dead = true
+                    throw error
+                } finally {
+                    if (run.session === session) run.session = null
+                }
+                // release this sentence: its audio is done and no later
+                // sentence references it, so memory stays bounded
+                pending.delete(i)
+                entries.delete(i)
+                invariant(pending.size <= ahead - 1, 'released index frees a slot')
+                i += 1
+            }
+        } catch (error) {
+            failure = error
+        } finally {
             run.dead = true
             run.cancellable.cancel()
             try {
