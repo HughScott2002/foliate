@@ -93,20 +93,59 @@ const gstreamerPlayWav = async (wavPath, { rate } = {}) => {
     }
 }
 
+// Adaptive synth-ahead window. Synthesis (synth ms) versus audio time
+// (audio ms) is the real-time factor: below 1, the engine outruns playback
+// and the window can grow; above ~0.8 it is struggling and the window
+// shrinks so we do not over-buffer. Grows by 2 after 3 fast sentences in a
+// row; shrinks by 1 when slow; clamped to [AHEAD_MIN, AHEAD_MAX].
+export const adaptWindow = (window, streak, rtf) => {
+    if (rtf > 0.8) return { window: Math.max(AHEAD_MIN, window - 1), streak: 0 }
+    if (rtf < 0.5) {
+        const next = streak + 1
+        if (next >= 3) return { window: Math.min(AHEAD_MAX, window + 2), streak: 0 }
+        return { window, streak: next }
+    }
+    return { window, streak: 0 }
+}
+
 export class LocalTTSPlayer {
     #tts
     #makeSession
+    #synthAhead
+    #rtfStreak = 0
+    #log
     #run = null
     #rate = 1
     #paused = false
 
-    constructor({ tts, playWav } = {}) {
+    constructor({ tts, playWav, synthAhead = AHEAD_DEFAULT, log } = {}) {
         if (!tts)
             throw new Error('LocalTTSPlayer requires a tts instance')
         this.#tts = tts
         // injectable pipeline boundary: tests pass a fake session
         // factory here instead of driving real audio
         this.#makeSession = playWav ?? gstreamerPlayWav
+        this.#synthAhead = clampAhead(synthAhead)
+        // injectable so tests can read the flow lines (console.debug is
+        // read-only in GJS)
+        this.#log = log ?? ((...args) => console.debug(...args))
+    }
+
+    // Current synth-ahead window (sentences beyond the playing one), and the
+    // measured real-time factor of the last sentence (for diagnostics).
+    get synthAhead() { return this.#synthAhead }
+
+    // Fold one sentence's timing into the window and emit the debug line the
+    // flow is audited with: rtf < 1 means the next sentence will be ready.
+    #observe(synthMs, duration, ready) {
+        const audioMs = Math.max(1, (duration || 0) * 1000)
+        const rtf = synthMs / audioMs
+        const next = adaptWindow(this.#synthAhead, this.#rtfStreak, rtf)
+        this.#synthAhead = next.window
+        this.#rtfStreak = next.streak
+        this.#log(`narrate: synth ${Math.round(synthMs)}ms `
+            + `audio ${(duration || 0).toFixed(2)}s rtf ${rtf.toFixed(2)} `
+            + `ready ${ready} win ${this.#synthAhead}`)
     }
 
     // Play the sentences (a {text, index} array) in order. onMark fires
@@ -256,7 +295,7 @@ export class LocalTTSPlayer {
     // released once its audio has played); every loop iteration either
     // plays one sentence or ends the stream.
     async playStream(source, {
-        pack, voice, rate, synthAhead = AHEAD_DEFAULT, onMark, onEnd, onError,
+        pack, voice, rate, synthAhead, onMark, onEnd, onError,
     } = {}) {
         invariant(typeof source === 'function', 'source must be a function')
         while (this.#run) {
@@ -275,11 +314,14 @@ export class LocalTTSPlayer {
         }
         this.#run = run
 
-        const ahead = clampAhead(synthAhead)
+        const ahead = clampAhead(synthAhead ?? this.#synthAhead)
         invariant(ahead >= AHEAD_MIN && ahead <= AHEAD_MAX, 'ahead in bounds')
+        this.#synthAhead = ahead
+        this.#rtfStreak = 0
 
         // Bounded state: at most `ahead` sentences are ever held. Both maps
-        // are pruned as each sentence finishes playing.
+        // are pruned as each sentence finishes playing. `ahead` is re-read
+        // each iteration so the adaptive window takes effect live.
         const pending = new Map()  // index -> {text, index, lang}
         const entries = new Map()  // index -> synth promise
         let chain = Promise.resolve()
@@ -295,6 +337,7 @@ export class LocalTTSPlayer {
             invariant(typeof s.text === 'string', 'sentence text is a string')
             const entry = chain.then(async () => {
                 if (run.dead || failed) return { stopped: true }
+                const synthStart = Date.now()
                 try {
                     const result = await this.#tts.synth(s.text, pack, {
                         lang: s.lang,
@@ -304,7 +347,7 @@ export class LocalTTSPlayer {
                     invariant(result && typeof result.wavPath === 'string',
                         'synth result has a wavPath')
                     return run.dead || failed
-                        ? { stopped: true } : { result }
+                        ? { stopped: true } : { result, synthMs: Date.now() - synthStart }
                 } catch (error) {
                     failed = true
                     return run.dead ? { stopped: true } : { error }
@@ -319,7 +362,7 @@ export class LocalTTSPlayer {
         // schedules beyond the window: `entries.size` stays <= ahead.
         const fill = async target => {
             invariant(target >= 0, 'fill target is non-negative')
-            invariant(entries.size <= ahead, 'window not exceeded before fill')
+            invariant(entries.size <= this.#synthAhead, 'window not exceeded before fill')
             while (!run.dead && !sourceDone && scheduled < target) {
                 const s = await source()
                 if (run.dead) return
@@ -328,7 +371,8 @@ export class LocalTTSPlayer {
                 scheduled += 1
                 pending.set(scheduled, s)
                 schedule(scheduled)
-                invariant(entries.size <= ahead, 'window not exceeded after schedule')
+                invariant(entries.size <= this.#synthAhead,
+                    'window not exceeded after schedule')
             }
         }
 
@@ -336,14 +380,14 @@ export class LocalTTSPlayer {
             let i = 0
             while (!run.dead) {
                 invariant(i >= 0, 'playback index non-negative')
-                await fill(i + ahead - 1)
+                await fill(i + this.#synthAhead - 1)
                 if (run.dead) break
                 // fill either produced sentence i or exhausted the source
                 invariant(entries.has(i) || sourceDone,
                     'fill produced i or ended the source')
                 const entry = entries.get(i)
                 if (!entry) break // source exhausted, nothing left to play
-                const { result, error, stopped } = await entry
+                const { result, error, stopped, synthMs } = await entry
                 if (stopped) break
                 if (error) {
                     run.dead = true
@@ -375,7 +419,10 @@ export class LocalTTSPlayer {
                 // sentence references it, so memory stays bounded
                 pending.delete(i)
                 entries.delete(i)
-                invariant(pending.size <= ahead - 1, 'released index frees a slot')
+                invariant(pending.size <= this.#synthAhead - 1,
+                    'released index frees a slot')
+                // fold the measured timing into the window and log the flow
+                if (synthMs != null) this.#observe(synthMs, result.duration, entries.size)
                 i += 1
             }
         } catch (error) {

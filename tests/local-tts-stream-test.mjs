@@ -1,5 +1,5 @@
 import { exit } from 'system'
-import { LocalTTSPlayer } from '../src/local-tts-player.js'
+import { LocalTTSPlayer, adaptWindow } from '../src/local-tts-player.js'
 
 // The flow invariant this suite protects: a sentence is synthesized BEFORE
 // the sentence playing ahead of it finishes. When that holds, the reader
@@ -185,8 +185,8 @@ const assertPrefetched = (events, order) => {
         'no new playback may start after stop')
 }
 
-// --- case 5: the window is bounded — no more than `ahead` sentences are
-// ever synthesized-but-unplayed, however long the block ---
+// --- case 5: the window is bounded — with a fast engine it adapts UP, but
+// never past AHEAD_MAX ---
 {
     const sentences = Array.from({ length: 50 }, (_, i) => `g${i}`)
     const blocks = [{ id: 'g1', sentences }]
@@ -202,31 +202,19 @@ const assertPrefetched = (events, order) => {
         else if (type === 'play-end') inFlight--
         max = Math.max(max, inFlight)
     }
-    assert(max <= 4, `synth window exceeded: ${max} sentences in flight (max 4)`)
-    assert(max >= 2, `window too small to prefetch (max in flight ${max})`)
+    assert(max <= 16, `synth window exceeded the cap: ${max} in flight`)
+    assert(max > 4, `fast sentences should have grown the window (max ${max})`)
+    assert(player.synthAhead === 16, `window should reach the cap, got ${player.synthAhead}`)
 }
 
-// --- case 6: synthAhead is clamped to [1, 16] ---
+// --- case 6: the constructor clamps synthAhead to [1, 16] ---
 {
-    const runWith = async ahead => {
-        const sentences = Array.from({ length: 30 }, (_, i) => `h${i}`)
-        const h = makeHarness({ blocks: [{ id: 'h1', sentences }] })
-        const player = new LocalTTSPlayer({ tts: h.tts, playWav: h.playWav })
-        const run = player.playStream(h.source, { pack: {}, synthAhead: ahead })
-        await drive(h, 30)
-        await run
-        let inFlight = 0
-        let max = 0
-        for (const [type] of h.events) {
-            if (type === 'synth-start') inFlight++
-            else if (type === 'play-end') inFlight--
-            max = Math.max(max, inFlight)
-        }
-        return max
-    }
-    assert(await runWith(0) <= 1, 'synthAhead 0 clamps up to 1')
-    assert(await runWith(999) <= 16, 'synthAhead 999 clamps down to 16')
-    assert(await runWith(999) >= 16, 'a large window actually fills to the cap')
+    const h = makeHarness({ blocks: [{ id: 'h1', sentences: ['h1'] }] })
+    const make = n => new LocalTTSPlayer({ tts: h.tts, playWav: h.playWav, synthAhead: n })
+    assert(make(0).synthAhead === 1, 'synthAhead 0 clamps up to 1')
+    assert(make(999).synthAhead === 16, 'synthAhead 999 clamps down to 16')
+    assert(make(5).synthAhead === 5, 'synthAhead in range is kept')
+    assert(make(undefined).synthAhead === 4, 'default window is 4')
 }
 
 // --- case 7: a non-function source is rejected ---
@@ -236,6 +224,51 @@ const assertPrefetched = (events, order) => {
     let threw = false
     try { await player.playStream(null, { pack: {} }) } catch { threw = true }
     assert(threw, 'playStream must reject a non-function source')
+}
+
+// --- case 8: adaptive window arithmetic ---
+{
+    const AHEAD_MIN = 1
+    const AHEAD_MAX = 16
+    // fast sentences: grows by 2 after 3 in a row
+    let s = { window: 4, streak: 0 }
+    s = adaptWindow(s.window, s.streak, 0.1)
+    assert(s.window === 4 && s.streak === 1, 'fast one: window holds, streak 1')
+    s = adaptWindow(s.window, s.streak, 0.1)
+    assert(s.window === 4 && s.streak === 2, 'fast two: window holds, streak 2')
+    s = adaptWindow(s.window, s.streak, 0.1)
+    assert(s.window === 6 && s.streak === 0, 'fast three: window grows by 2')
+    // slow sentence: shrinks by 1 and resets the streak
+    s = adaptWindow(6, 2, 0.9)
+    assert(s.window === 5 && s.streak === 0, 'slow: window shrinks by 1, streak reset')
+    // middle rtf: resets the streak, window unchanged
+    s = adaptWindow(6, 2, 0.6)
+    assert(s.window === 6 && s.streak === 0, 'middling rtf resets the streak')
+    // clamps
+    assert(adaptWindow(AHEAD_MIN, 0, 0.99).window === AHEAD_MIN, 'never below the minimum')
+    let w = AHEAD_MAX - 1
+    let st = 2
+    ;({ window: w } = adaptWindow(w, st, 0.1))
+    assert(w === AHEAD_MAX, 'never above the maximum')
+    // non-finite rtf cannot move the window
+    assert(adaptWindow(7, 0, NaN).window === 7, 'NaN rtf is inert')
+}
+
+// --- case 9: the player emits a per-sentence timing line ---
+{
+    const blocks = [{ id: 'k1', sentences: ['k1', 'k2', 'k3'] }]
+    const h = makeHarness({ blocks })
+    const lines = []
+    const player = new LocalTTSPlayer({
+        tts: h.tts, playWav: h.playWav, log: line => lines.push(line),
+    })
+    const run = player.playStream(h.source, { pack: {}, synthAhead: 4 })
+    await drive(h, 3)
+    await run
+    const narrate = lines.filter(l => l.includes('narrate:'))
+    assert(narrate.length === 3, `expected a narrate line per sentence, got ${narrate.length}`)
+    assert(narrate.every(l => l.includes('rtf') && l.includes('win')),
+        'narrate lines carry rtf and window')
 }
 
 if (failures) {
