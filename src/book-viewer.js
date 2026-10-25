@@ -868,6 +868,9 @@ export const BookViewer = GObject.registerClass({
             saved: this.#data?.storage.get('tts-voice-pack'),
             language: primary,
         }))
+        // load the voice model now, in the background, so the first Play has
+        // no model-load wait (best effort; see TTSBox.warm)
+        tts.warm()
     }
     #showVoices(startAfterSelection = false) {
         if (this.#voiceManager) return

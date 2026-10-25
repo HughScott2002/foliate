@@ -109,7 +109,7 @@ export const parseWavDuration = path => {
 // pack, the voice id, and — only where the engine takes it — the language.
 // NUL separators keep fields from blurring into each other ('ab'+'c' must
 // not hash as 'a'+'bc').
-const cacheKey = (text, id, sid, lang) => GLib.compute_checksum_for_bytes(
+export const cacheKey = (text, id, sid, lang) => GLib.compute_checksum_for_bytes(
     GLib.ChecksumType.SHA256, new GLib.Bytes(
         new TextEncoder().encode(
             `${text}\0${id}\0${sid}${lang ? `\0${lang}` : ''}`)))

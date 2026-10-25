@@ -45,7 +45,9 @@ export const TTSBox = GObject.registerClass({
     #generation = 0
     #settings = utils.settings('viewer')
     #backend = this.#settings?.get_string('tts-backend') ?? 'local'
-    #player = new LocalTTSPlayer({ tts: new LocalTTS() })
+    #tts = new LocalTTS()
+    #player = new LocalTTSPlayer({ tts: this.#tts })
+    #warmed = new Set()
     language = 'en'
     pack = null
     defaultWidget = this._play_button
@@ -80,6 +82,24 @@ export const TTSBox = GObject.registerClass({
         this.stop()
         this.pack = pack
         this._voice_label.label = pack?.label ?? _('Download a voice to get started')
+    }
+    // Warm the chosen pack in the background: synthesize a short sample so
+    // the daemon lazy-loads the model while the reader is still finding
+    // their place, instead of paying the model load on first Play. One
+    // primer per pack per session; the result is cached and harmless.
+    async warm() {
+        const pack = this.pack
+        if (this.backend !== 'local' || !pack) return
+        if (!getInstalledPacks().some(x => x.id === pack.id)) return
+        if (this.#warmed.has(pack.id)) return
+        this.#warmed.add(pack.id)
+        const lang = (this.language || 'en').split('-')[0]
+        try {
+            await this.#tts.synth(pack.sample, pack, { lang })
+        } catch (e) {
+            // a warm-up is best effort; first Play just pays the load instead
+            console.debug(`tts warm-up skipped: ${e.message}`)
+        }
     }
     #connectScale(scale, f) {
         scale.connect('value-changed', scale => {

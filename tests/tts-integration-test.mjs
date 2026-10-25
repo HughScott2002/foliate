@@ -70,6 +70,16 @@ const web = viewer._view.webView
 await until(() => tts.pack, 'book never became ready')
 check(tts.pack.id === 'supertonic',
     `English book did not select the default pack (got ${tts.pack.id})`)
+// the primer warms the chosen pack at book open: the sample lands in the
+// wav cache while nothing is playing, so first Play has no model-load wait
+{
+    const { cacheKey } = await import('../src/local-tts.js')
+    const cacheDir = GLib.build_filenamev([GLib.get_user_cache_dir(), 'foliate', 'tts-wav'])
+    const key = cacheKey(tts.pack.sample, tts.pack.id, tts.pack.sid, 'en')
+    const samplePath = GLib.build_filenamev([cacheDir, `${key}.wav`])
+    await until(() => GLib.file_test(samplePath, GLib.FileTest.IS_REGULAR),
+        'primer did not cache the pack sample at book open')
+}
 let marks = 0
 tts.connect('highlight', () => { marks++ })
 tts.start()
