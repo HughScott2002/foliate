@@ -132,4 +132,33 @@ the completeness comes from the `fst` backend later — callers never change.
 Normalization is pure and microseconds-fast, so it has no cache of its own:
 the audio cache keys on the normalized text. Highlight marks are unaffected.
 Applies to the local pipeline; speech-dispatcher keeps its own SSIP text.
-DOM-level stripping (footnote markers, running heads) is deferred.
+
+## Skippable content (as built)
+
+`src/foliate-js/dom-stripper.js` classifies each node with Guided Navigation
+roles — the element tag, its ARIA `role`, its `epub:type`, and the O'Reilly
+`data-type` convention — adapted from `@readium/guided-navigation` (BSD-3).
+`getFragmentWithMarks` then drops skippable subtrees from BOTH the sentence
+walk and the SSML fragment.
+
+The default skip set is "meat only", mirroring `@readium/speech`'s
+`skippableRoles` plus noteref markers and pagebreak labels: footnotes,
+endnotes, asides, tables, figures, images, media, glossary, bibliography,
+pullquotes, and navigation (toc, landmarks, page lists, pagebreaks). A
+`tts-read-footnotes` preference (off by default; a check button in the
+narration panel) un-skips the note roles so footnotes/endnotes are read in
+DOM order — Cloud's chapter-end notes at the chapter end, Ego's inline. The
+noteref marker itself is never read, in either mode (per the Readium spec).
+A role another role carries drops its skippable role (a footnote's own
+`aside`), so un-skipping notes actually reads `aside`-wrapped footnotes.
+
+Verified against real books: every page of 11 books (Cloud/O'Reilly uses
+`data-type`; Ego uses `epub:type`; Made to Stick, progit, etc.) — no crashes,
+no over-stripping on prose, no leaks. Two pre-existing foliate-js bugs were
+found and fixed along the way: a crash in `getSegmenter` when an element node
+(whence `nodeValue` is null) landed in the walk, and `fragmentToSSML` dropping
+a block's leading text when it contained a nested block (nested lists).
+
+Known limits: plain-text footnote digits ("estimates.1" with no `<sup>`/role)
+are invisible to role-based stripping; running heads / page numbers in the DOM
+still need a reader-side filter.
