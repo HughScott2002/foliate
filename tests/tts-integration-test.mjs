@@ -93,15 +93,29 @@ check(tts.state === 'paused' && nav.shouldStayVisible, 'pause hid controls')
 // Capture rendered app, including WebKit highlight and persistent controls.
 await delay(250)
 const paintable = new Gtk.WidgetPaintable({ widget: win })
-const snapshot = new Gtk.Snapshot()
-paintable.snapshot(snapshot, win.get_width(), win.get_height())
 const bounds = new Graphene.Rect()
 bounds.init(0, 0, win.get_width(), win.get_height())
-const node = snapshot.to_node()
-win.get_renderer().render_texture(node, bounds).save_to_png('/tmp/opencode/foliate-narration.png')
+// the widget must have painted before it can be snapshotted; retry briefly
+// rather than failing on a null node (a harness race, not a product issue)
+{
+    let saved = false
+    for (let n = 0; n < 40 && !saved; n++) {
+        const renderer = win.get_renderer()
+        const snapshot = new Gtk.Snapshot()
+        paintable.snapshot(snapshot, win.get_width(), win.get_height())
+        const node = snapshot.to_node()
+        if (renderer && node) {
+            renderer.render_texture(node, bounds).save_to_png('/tmp/opencode/foliate-narration.png')
+            saved = true
+        } else await delay(25)
+    }
+    // best effort: the screenshot is a review artifact, not a pass/fail
+    // condition; headless GTK occasionally never paints
+    if (!saved) printerr('WARN: window never produced a frame to screenshot')
+}
 tts.start()
 await until(() => tts.state === 'stopped', 'narration never reached book end')
-check(marks >= 4, 'narration did not cross all sentence/chapter marks')
+check(marks >= 4, `narration did not cross all sentence/chapter marks (marks=${marks})`)
 check(!await web.eval('reader.view.renderer.getContents()[0].doc.defaultView.CSS.highlights.has("foliate-narration")'),
     'highlight survived end of book')
 check(!nav.shouldStayVisible, `navbar remained pinned after narration ended: tts=${tts.state}, `

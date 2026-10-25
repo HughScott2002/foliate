@@ -364,7 +364,18 @@ class Reader {
             i > index && section.linear !== 'no')
         if (next < 0) return false
         this.ttsClear()
-        await this.view.renderer.goTo({ index: next })
+        // goTo can be dropped while the renderer is busy (#locked) and can
+        // resolve before the new section's document is the visible one;
+        // initTTS reads that document, so a half-applied section change
+        // would leave the TTS iterator pointing at the old section and the
+        // stream would stall at the boundary. Retry until the renderer
+        // actually reports the new index (bounded), then re-init.
+        for (let n = 0; n < 40; n++) {
+            await this.view.renderer.goTo({ index: next })
+            if (this.view.renderer.getContents()[0]?.index === next) break
+            await new Promise(resolve => setTimeout(resolve, 25))
+        }
+        if (this.view.renderer.getContents()[0]?.index !== next) return false
         await this.initTTS(this.localNarration)
         return true
     }
