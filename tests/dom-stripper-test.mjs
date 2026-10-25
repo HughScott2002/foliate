@@ -54,6 +54,7 @@ webView.load_html(`<html lang="en" xmlns:epub="http://www.idpf.org/2007/ops"><bo
 <p>Paged <span data-type="pagebreak">88</span> again.</p>
 <table><tbody><tr><th>Header cell</th></tr><tr><td>Data cell value</td></tr></tbody></table>
 <figure><img alt="A picture"/><figcaption>Figure caption text</figcaption></figure>
+<ul><li>Parent item text<ul><li>Nested child item</li></ul></li></ul>
 </main>
 </body>
 <script type="module">
@@ -127,6 +128,9 @@ try {
     check(!text.includes('Data cell value') && !text.includes('Header cell'),
         'table content was spoken: ' + JSON.stringify(text))
     check(!text.includes('Figure caption text'), 'figure caption was spoken: ' + JSON.stringify(text))
+    // a nested list's PARENT item must be spoken, not just its children
+    check(text.includes('Parent item text') && text.includes('Nested child item'),
+        'nested-list parent item lost: ' + JSON.stringify(text))
 
     // "read notes" on: footnotes ARE spoken, the noteref marker still is not
     const speak = readNotes => {
