@@ -77,3 +77,35 @@ C. Run kokoro-js in the WebKit view — no native dep, but WASM speed in
 - Exact pack URLs/SHA (pin at implementation time).
 - Word-timestamp plumbing if Kokoro token durations prove awkward:
   sentence highlight first, word marks as a stretch.
+
+## Flow (as built)
+
+Narration is one continuous sentence stream, not one block at a time:
+
+- `tts.js #speakStream` builds a sentence stream; `LocalTTSPlayer.playStream`
+  pulls blocks **ahead of playback** (adaptive window 1..16, default 4) so a
+  block's sentences are fetched and synthesized while the previous block is
+  still being read aloud. No synthesis lands on the speaker at a paragraph or
+  chapter boundary, and the queue crosses chapters in place.
+- Window adapts to the measured real-time factor (synth ms / audio ms): grows
+  on headroom, shrinks under load. Per-sentence `narrate:` debug line makes
+  flow auditable.
+- The model is warmed at book open (primer) so first Play has no model-load
+  wait.
+- Lookahead advances foliate-js's iterator past the sentence being read,
+  overwriting its mark→range map; the reader snapshots each fetched block's
+  ranges under a `seq`, so the read-along highlight always uses the playing
+  sentence's own block.
+- Deferred: PCM streaming of the first sentence (helps kokoro; supertonic,
+  the default, is already under the ~0.5s first-audio target).
+
+## Text normalization (as built)
+
+`src/tts-normalize.js` `normalizeSentence()` cleans a sentence before it
+reaches the engine and the wav cache key: soft hyphens removed, line-break
+hyphens joined, ligatures expanded, a safe abbreviation set expanded, symbols
+(`&`, `§`, `+`, `=`, `%`, `$`, dashes, ellipsis) rendered as words. Pure and
+microseconds-fast, so it has no cache of its own: the audio cache keys on the
+normalized text. Highlight marks are unaffected. Applies to the local
+pipeline; speech-dispatcher keeps its own SSIP text. DOM-level stripping
+(footnote markers, running heads) is deferred.
