@@ -44,6 +44,10 @@
       <choices><choice value="local"/><choice value="speechd"/></choices>
       <default>'local'</default>
     </key>
+    <key name="tts-normalizer" type="s">
+      <choices><choice value="rules"/><choice value="none"/></choices>
+      <default>'rules'</default>
+    </key>
     <child schema="com.github.johnfactotum.Foliate.viewer.view" name="view"/>
     <child schema="com.github.johnfactotum.Foliate.viewer.font" name="font"/>
     <key name="fold-sidebar" type="b">

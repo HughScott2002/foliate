@@ -1,6 +1,6 @@
 import { makeBook, NotFoundError, UnsupportedTypeError } from '../foliate-js/view.js'
 import { Overlayer } from '../foliate-js/overlayer.js'
-import { parseSSML, NarrationHighlight } from './tts.js'
+import { parseSSML, NarrationHighlight, highlightTarget } from './tts.js'
 import { FootnoteHandler } from '../foliate-js/footnotes.js'
 import { toPangoMarkup } from './markup.js'
 
@@ -291,6 +291,10 @@ class Reader {
     #rangeMap = new Map()
     #blockSeq = -1
     #capturedRange = null
+    // a selection range to start from, set by speak-from-here-local and
+    // consumed by ttsStart after initTTS has run (so the block snapshot is
+    // taken after the map is cleared, not before)
+    #pendingRange = null
     async initTTS(local = false) {
         if (this.localNarration !== local) this.view.tts = null
         this.localNarration = local
@@ -318,27 +322,40 @@ class Reader {
             if (this.#capturedRange) marks.set(String(s.index), this.#capturedRange)
         }
         this.#rangeMap.set(seq, marks)
+        // keep only recent snapshots: a sentence's seq is fetched at most a
+        // window ahead of playback, so a strictly older snapshot has already
+        // played and is never needed again (bounds the map for long sections)
+        for (const key of this.#rangeMap.keys())
+            if (key <= seq - 32) this.#rangeMap.delete(key)
         return { ssml, seq }
     }
     ttsStart() {
         if (!this.localNarration) return this.view.tts.start()
-        return this.#fetchBlock('start', this.view.lastLocation?.range)
+        const range = this.#pendingRange ?? this.view.lastLocation?.range
+        this.#pendingRange = null
+        return this.#fetchBlock('start', range)
     }
-    ttsNext() { return this.localNarration ? this.#fetchBlock('next') : this.view.tts.next() }
-    ttsPrev() { return this.localNarration ? this.#fetchBlock('prev') : this.view.tts.prev() }
+    ttsNext(paused) {
+        return this.localNarration ? this.#fetchBlock('next') : this.view.tts.next(paused)
+    }
+    ttsPrev(paused) {
+        return this.localNarration ? this.#fetchBlock('prev') : this.view.tts.prev(paused)
+    }
     ttsParse(ssml) { return parseSSML(ssml) }
     ttsClear() { this.narrationHighlight.clear() }
-    // local passes {seq, mark}; speechd passes a bare mark
+    // local passes {seq, mark} (resolved from the snapshot); speech-dispatcher
+    // passes {mark} (no seq) and is resolved by foliate-js's own callback
     ttsSetMark(x) {
-        if (x && typeof x === 'object') {
-            const range = this.#rangeMap.get(x.seq)?.get(String(x.mark))
+        const { mark, seq } = highlightTarget(x)
+        if (seq != null) {
+            const range = this.#rangeMap.get(seq)?.get(String(mark))
             if (range) {
                 this.view.renderer.scrollToAnchor(range, true)
                 this.narrationHighlight.show(range)
             }
             return
         }
-        this.view.tts.setMark(x)
+        this.view.tts.setMark(mark)
     }
     async ttsNextSection() {
         const index = this.view.renderer.getContents()[0]?.index
@@ -492,14 +509,21 @@ class Reader {
                     this.printRange(range.startContainer.ownerDocument, range)
                     break
                 case 'speak-from-here':
-                case 'speak-from-here-local':
-                    this.initTTS(action === 'speak-from-here-local').then(() => emit({
-                        type: 'selection', action: 'speak-from-here',
-                        ...(action === 'speak-from-here-local'
-                            ? this.#fetchBlock('start', range)
-                            : { ssml: this.view.tts.from(range) }),
-                    }))
+                case 'speak-from-here-local': {
+                    const local = action === 'speak-from-here-local'
+                    this.initTTS(local).then(() => {
+                        // local: hand the range to ttsStart so the starting
+                        // block is fetched (and its ranges snapshotted)
+                        // AFTER the run's init clears the map. speechd: the
+                        // SSML is produced here as before.
+                        if (local) this.#pendingRange = range
+                        emit({
+                            type: 'selection', action: 'speak-from-here',
+                            ...(local ? {} : { ssml: this.view.tts.from(range) }),
+                        })
+                    })
                     break
+                }
             }
         })
     }

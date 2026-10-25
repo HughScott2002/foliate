@@ -52,3 +52,12 @@ export class NarrationHighlight {
         this.#window = null
     }
 }
+
+// Normalize a highlight signal payload to {mark, seq}. A `seq` (present only
+// on the local path) selects the block-snapshot resolution; its absence is
+// the speech-dispatcher path, resolved by foliate-js's own callback. An
+// object WITHOUT seq must fall through, not be treated as local.
+export const highlightTarget = x => {
+    const isObj = x !== null && typeof x === 'object'
+    return { mark: isObj ? x.mark : x, seq: isObj ? x.seq : undefined }
+}

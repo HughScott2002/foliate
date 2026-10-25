@@ -83,29 +83,53 @@ C. Run kokoro-js in the WebKit view — no native dep, but WASM speed in
 Narration is one continuous sentence stream, not one block at a time:
 
 - `tts.js #speakStream` builds a sentence stream; `LocalTTSPlayer.playStream`
-  pulls blocks **ahead of playback** (adaptive window 1..16, default 4) so a
+  pulls blocks **ahead of playback** (adaptive window 2..16, default 4) so a
   block's sentences are fetched and synthesized while the previous block is
-  still being read aloud. No synthesis lands on the speaker at a paragraph or
-  chapter boundary, and the queue crosses chapters in place.
+  still being read aloud. No synthesis lands on the speaker at a paragraph
+  boundary.
+- A **section boundary** is a different thing: the source returns a
+  `SECTION_END` marker, which lookahead may discover but never crosses. The
+  queue holds at the boundary and pages the renderer only when playback
+  actually reaches it (`onSectionEnd`). So the page turns neither early nor
+  clears highlight state a still-playing sentence needs. Cost: one synthesis
+  on the critical path per section (the first sentence of the next section),
+  which is the accepted trade for a correct page turn.
 - Window adapts to the measured real-time factor (synth ms / audio ms): grows
-  on headroom, shrinks under load. Per-sentence `narrate:` debug line makes
-  flow auditable.
+  on headroom, shrinks under load, floored at 2 so at least one sentence is
+  always synthesized ahead. Per-sentence `narrate:` debug line makes flow
+  auditable.
 - The model is warmed at book open (primer) so first Play has no model-load
-  wait.
+  wait (primer is skipped unless the daemon is up, so it never occupies the
+  one-shot CLI engine's slot).
 - Lookahead advances foliate-js's iterator past the sentence being read,
   overwriting its mark→range map; the reader snapshots each fetched block's
   ranges under a `seq`, so the read-along highlight always uses the playing
-  sentence's own block.
+  sentence's own block. Snapshots are pruned to the recent window.
 - Deferred: PCM streaming of the first sentence (helps kokoro; supertonic,
   the default, is already under the ~0.5s first-audio target).
 
 ## Text normalization (as built)
 
-`src/tts-normalize.js` `normalizeSentence()` cleans a sentence before it
-reaches the engine and the wav cache key: soft hyphens removed, line-break
-hyphens joined, ligatures expanded, a safe abbreviation set expanded, symbols
-(`&`, `§`, `+`, `=`, `%`, `$`, dashes, ellipsis) rendered as words. Pure and
-microseconds-fast, so it has no cache of its own: the audio cache keys on the
-normalized text. Highlight marks are unaffected. Applies to the local
-pipeline; speech-dispatcher keeps its own SSIP text. DOM-level stripping
-(footnote markers, running heads) is deferred.
+`src/tts-normalize.js` exposes one stable entry point, `normalizeText(text,
+lang)`, and nothing else in the app touches the backend. The backend is
+chosen at startup from the `tts-normalizer` setting:
+
+- `rules` (default) — a conservative, English-first built-in ruleset: soft
+  hyphens removed, line-break hyphens joined, ligatures expanded, a small
+  abbreviation set expanded, symbols (`&`, `§`, `+`, `=`, `%`, `$`, dashes,
+  ellipsis) rendered as words. Universal cleanups run for any language;
+  English-only rewrites (symbols, currency, abbreviations) are gated on the
+  language. This is deliberately **not** a complete normalizer.
+- `none` — identity; something downstream normalizes instead.
+- `fst` — reserved for NeMo/WeTextProcessing-style grammars compiled to
+  OpenFst FSTs (run by the engine, not by JavaScript). Until it is wired in
+  it behaves as `none`, so the two never both run and double-normalize.
+
+There is no complete TTS text normalizer in plain JavaScript: the complete
+ones are Python/FST (NeMo), and the JS ones that exist target ASR/WER
+canonicalization, the wrong direction. So the *interface* is built now and
+the completeness comes from the `fst` backend later — callers never change.
+Normalization is pure and microseconds-fast, so it has no cache of its own:
+the audio cache keys on the normalized text. Highlight marks are unaffected.
+Applies to the local pipeline; speech-dispatcher keeps its own SSIP text.
+DOM-level stripping (footnote markers, running heads) is deferred.

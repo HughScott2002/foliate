@@ -56,6 +56,14 @@ try {
     check(document.querySelector('style[data-foliate-narration]'), 'style missing')
     highlights.clear()
     check(!CSS.highlights.has('foliate-narration'), 'highlight survives stop')
+    // highlight payload routing: a bare mark or an object WITHOUT seq is the
+    // speech-dispatcher path and must fall through (seq undefined)
+    check(highlightTarget('3').seq === undefined && highlightTarget('3').mark === '3',
+        'bare mark falls through to speechd path')
+    check(highlightTarget({ mark: '3' }).seq === undefined,
+        'object without seq must not be treated as local')
+    check(highlightTarget({ seq: 2, mark: '3' }).seq === 2,
+        'object with seq selects the snapshot path')
     window.webkit.messageHandlers.result.postMessage(JSON.stringify({
         passed: true, message: 'Reader SSML and highlight tests passed',
     }))

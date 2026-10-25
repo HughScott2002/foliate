@@ -1,5 +1,5 @@
 import { exit } from 'system'
-import { LocalTTSPlayer, adaptWindow } from '../src/local-tts-player.js'
+import { LocalTTSPlayer, adaptWindow, SECTION_END } from '../src/local-tts-player.js'
 
 // The flow invariant this suite protects: a sentence is synthesized BEFORE
 // the sentence playing ahead of it finishes. When that holds, the reader
@@ -23,7 +23,7 @@ const settle = async (n = 50) => { for (let i = 0; i < n; i++) await tick() }
 
 // Deterministic harness: synthesis and playback both resolve only when the
 // driver says so, so event ORDER is the whole test — no timers.
-const makeHarness = ({ blocks }) => {
+const makeHarness = ({ blocks, sectioned = false }) => {
     const events = []
     const synths = new Map()
     const plays = new Map()
@@ -61,13 +61,16 @@ const makeHarness = ({ blocks }) => {
     // log shows exactly when a boundary was pulled relative to playback.
     let bi = 0
     let si = 0
+    let broke = false
     const source = async () => {
         await tick() // simulate one RPC round trip per sentence pull
         if (bi >= blocks.length) return null
+        // a sectioned source signals the boundary before each new block
+        if (sectioned && bi > 0 && !broke) { broke = true; return SECTION_END }
         if (si === 0) events.push(['fetch', blocks[bi].id])
         const text = blocks[bi].sentences[si]
         si++
-        if (si >= blocks[bi].sentences.length) { si = 0; bi++ }
+        if (si >= blocks[bi].sentences.length) { si = 0; bi++; broke = false }
         return { text, index: text, lang: 'en' }
     }
     return { events, tts, playWav, source, synths, plays }
@@ -207,11 +210,12 @@ const assertPrefetched = (events, order) => {
     assert(player.synthAhead === 16, `window should reach the cap, got ${player.synthAhead}`)
 }
 
-// --- case 6: the constructor clamps synthAhead to [1, 16] ---
+// --- case 6: the constructor clamps synthAhead to [2, 16] ---
 {
     const h = makeHarness({ blocks: [{ id: 'h1', sentences: ['h1'] }] })
     const make = n => new LocalTTSPlayer({ tts: h.tts, playWav: h.playWav, synthAhead: n })
-    assert(make(0).synthAhead === 1, 'synthAhead 0 clamps up to 1')
+    assert(make(0).synthAhead === 2, 'synthAhead 0 clamps up to 2 (floor keeps lookahead)')
+    assert(make(1).synthAhead === 2, 'synthAhead 1 clamps up to 2')
     assert(make(999).synthAhead === 16, 'synthAhead 999 clamps down to 16')
     assert(make(5).synthAhead === 5, 'synthAhead in range is kept')
     assert(make(undefined).synthAhead === 4, 'default window is 4')
@@ -228,7 +232,7 @@ const assertPrefetched = (events, order) => {
 
 // --- case 8: adaptive window arithmetic ---
 {
-    const AHEAD_MIN = 1
+    const AHEAD_MIN = 2
     const AHEAD_MAX = 16
     // fast sentences: grows by 2 after 3 in a row
     let s = { window: 4, streak: 0 }
@@ -269,6 +273,34 @@ const assertPrefetched = (events, order) => {
     assert(narrate.length === 3, `expected a narrate line per sentence, got ${narrate.length}`)
     assert(narrate.every(l => l.includes('rtf') && l.includes('win')),
         'narrate lines carry rtf and window')
+}
+
+// --- case 10: a section boundary is crossed only when playback reaches it,
+// never during lookahead ---
+{
+    const blocks = [
+        { id: 's1', sentences: ['p1', 'p2', 'p3'] },
+        { id: 's2', sentences: ['q1', 'q2'] },
+    ]
+    const h = makeHarness({ blocks, sectioned: true })
+    const player = new LocalTTSPlayer({ tts: h.tts, playWav: h.playWav })
+    const at = []
+    const run = player.playStream(h.source, {
+        pack: {}, synthAhead: 3,
+        onSectionEnd: async () => { at.push(h.events.length); return true },
+    })
+    await drive(h, 5)
+    await run
+    const lastP = h.events.findIndex(e => e[0] === 'play-end' && e[1] === 'p3')
+    const fetchS2 = h.events.findIndex(e => e[0] === 'fetch' && e[1] === 's2')
+    assert(at.length === 1, `section callback fired ${at.length} times, expected 1`)
+    assert(at[0] > lastP,
+        'section advanced before its last sentence finished playing')
+    assert(fetchS2 === -1 || fetchS2 > lastP,
+        'next section was fetched during lookahead, before the boundary was reached')
+    const played = h.events.filter(e => e[0] === 'play-end').map(e => e[1])
+    assert(JSON.stringify(played) === JSON.stringify(['p1', 'p2', 'p3', 'q1', 'q2']),
+        `playback order wrong across a boundary: ${played}`)
 }
 
 if (failures) {

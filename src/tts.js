@@ -5,9 +5,10 @@ import { gettext as _ } from 'gettext'
 import * as utils from './utils.js'
 import { SSIPClient } from './speech.js'
 import { LocalTTS } from './local-tts.js'
-import { LocalTTSPlayer } from './local-tts-player.js'
+import { LocalTTSPlayer, SECTION_END } from './local-tts-player.js'
 import { getInstalledPacks } from './voice-packs.js'
-import { normalizeSentence } from './tts-normalize.js'
+import { getVoiceDaemon } from './voice-daemon.js'
+import { normalizeText, setNormalizeBackend } from './tts-normalize.js'
 
 const ssip = new SSIPClient()
 
@@ -71,6 +72,11 @@ export const TTSBox = GObject.registerClass({
         this._local_rate.connect('value-changed', spin =>
             this.#player.setRate(spin.value))
         this._manage_voices_button.connect('clicked', () => this.emit('voices-requested', false))
+        // text normalization is a stable seam: 'rules' (built-in) or 'none'
+        // (an external normalizer, e.g. a compiled FST, does it downstream).
+        // Callers only ever use normalizeText(); the backend can change
+        // without touching them.
+        setNormalizeBackend(this.#settings?.get_string('tts-normalizer') ?? 'rules')
         this.#syncBackend()
     }
     get backend() { return this.#backend }
@@ -93,6 +99,12 @@ export const TTSBox = GObject.registerClass({
         if (this.backend !== 'local' || !pack) return
         if (!getInstalledPacks().some(x => x.id === pack.id)) return
         if (this.#warmed.has(pack.id)) return
+        // Only the daemon keeps a model loaded; if it is not up yet, skip —
+        // otherwise this primer would fall back to the one-shot CLI engine
+        // and occupy its single-process slot, making the first Play collide
+        // with "a synthesis is already in progress". First Play then just
+        // pays the model load.
+        if (!getVoiceDaemon().running) return
         this.#warmed.add(pack.id)
         const lang = (this.language || 'en').split('-')[0]
         try {
@@ -132,13 +144,16 @@ export const TTSBox = GObject.registerClass({
         const iter = await ssip.speak(ssml)
         let state
         for await (const { mark, message } of iter) {
-            if (mark) await this.emit('highlight', mark)
+            if (mark) await this.emit('highlight', { mark })
             else state = message
         }
         if (state === 'END') this.forward()
     }
-    speak(ssml) {
-        if (this.backend === 'local') return this.#beginLocal(null, ssml)
+    speak(payload) {
+        // local keeps the whole payload: the reader stored the selection
+        // range and will fetch the starting block after init (ttsStart)
+        if (this.backend === 'local') return this.#beginLocal('start')
+        const ssml = payload && typeof payload === 'object' ? payload.ssml : payload
         this.#init().then(() => this.#speak(ssml)).catch(e => this.error(e))
     }
     play() {
@@ -231,7 +246,7 @@ export const TTSBox = GObject.registerClass({
             if (generation !== this.#generation) return false
             const lang = (parsed.language || this.language).split('-')[0]
             for (const s of parsed.sentences)
-                buffer.push({ text: normalizeSentence(s.text),
+                buffer.push({ text: normalizeText(s.text, lang),
                     index: s.index, lang, seq: blk.seq })
             return true
         }
@@ -242,14 +257,12 @@ export const TTSBox = GObject.registerClass({
         const source = async () => {
             while (buffer.length === 0) {
                 if (generation !== this.#generation) return null
-                let blk = await this.emit('forward')
+                const blk = await this.emit('forward')
                 if (generation !== this.#generation) return null
                 if (!blk) {
-                    const advanced = await this.emit('next-section')
-                    if (generation !== this.#generation) return null
-                    if (!advanced) return null
-                    blk = await this.emit('forward')
-                    if (generation !== this.#generation || !blk) return null
+                    // the iterator is exhausted for this section: signal the
+                    // boundary; the player pages only when playback gets here
+                    return SECTION_END
                 }
                 if (!await addBlock(blk)) return null
             }
@@ -259,6 +272,10 @@ export const TTSBox = GObject.registerClass({
         await this.#player.playStream(source, {
             pack: this.pack,
             rate: this._local_rate.value,
+            onSectionEnd: async () => {
+                const advanced = await this.emit('next-section')
+                return generation === this.#generation && advanced
+            },
             onMark: entry => {
                 if (this.state === 'paused') this.#player.pause()
                 if (generation === this.#generation)

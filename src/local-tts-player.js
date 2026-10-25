@@ -1,6 +1,6 @@
 import Gio from 'gi://Gio'
 // Sentence-level playback queue on top of a LocalTTS instance: synthesize
-// ahead of playback (at most two sentences beyond the one being played,
+// ahead of playback (a small clamped window beyond the one being played,
 // executed strictly one at a time because LocalTTS rejects concurrent
 // synth), play each wav as it becomes ready, and own the lifecycle of
 // the whole run — pause, resume, rate changes, and a stop that stops the
@@ -14,8 +14,11 @@ const clampRate = rate => Math.min(RATE_MAX, Math.max(RATE_MIN, rate))
 
 // Synth-ahead window bounds: how many sentences beyond the one playing may
 // be scheduled (synthesized) at once. Bounded so the queue holds a fixed,
-// small number of sentences regardless of book length.
-const AHEAD_MIN = 1
+// small number of sentences regardless of book length. The floor is 2, not
+// 1: with 1 no sentence is fetched beyond the one playing, so every next
+// sentence is synthesized on the critical path — the spec requires the
+// sentence after the playing one to already be synthesized.
+const AHEAD_MIN = 2
 const AHEAD_MAX = 16
 const AHEAD_DEFAULT = 4
 const clampAhead = n => {
@@ -29,6 +32,13 @@ const clampAhead = n => {
 const invariant = (cond, msg) => {
     if (!cond) throw new Error(`local-tts-player: ${msg}`)
 }
+
+// A `source` may return this instead of a sentence or null: the current
+// section is exhausted but the book is not. The queue holds at the boundary
+// and calls `onSectionEnd` (which pages the renderer) only when playback
+// actually reaches it, so lookahead never turns the page early or drops
+// state that a still-playing sentence needs.
+export const SECTION_END = Symbol('section-end')
 
 // The error a session rejects with when its stop() is called: the queue
 // treats it as an ordinary stop, not a failure.
@@ -283,19 +293,23 @@ export class LocalTTSPlayer {
     }
 
     // Play a *stream* of sentences: `source()` is an async function that
-    // returns the next `{text, index, lang}` or null when the book ends.
+    // returns the next `{text, index, lang}`, `null` when the book ends, or
+    // SECTION_END when the current section is exhausted (see `onSectionEnd`).
     // Unlike play(), the source is pulled AHEAD of playback (up to
     // `synthAhead` sentences beyond the one playing), so the sentences of
     // the next block are fetched and synthesized while the current block
     // is still being read aloud — no synthesis lands on the speaker's
-    // critical path at a paragraph or chapter boundary.
+    // critical path at a paragraph boundary. A section boundary is
+    // discovered by lookahead but crossed only when playback reaches it:
+    // `onSectionEnd()` (page the renderer) is awaited at that point, never
+    // early.
     //
     // Bounds (TigerStyle): the window is clamped to [AHEAD_MIN, AHEAD_MAX];
     // `pending`/`entries` hold at most `ahead` sentences at once (each is
     // released once its audio has played); every loop iteration either
-    // plays one sentence or ends the stream.
+    // plays one sentence, crosses one boundary, or ends the stream.
     async playStream(source, {
-        pack, voice, rate, synthAhead, onMark, onEnd, onError,
+        pack, voice, rate, synthAhead, onMark, onSectionEnd, onEnd, onError,
     } = {}) {
         invariant(typeof source === 'function', 'source must be a function')
         while (this.#run) {
@@ -329,6 +343,14 @@ export class LocalTTSPlayer {
         let sourceDone = false
         let failed = false
         let failure = null
+        // index of the section boundary the lookahead ran into, or -1. Set
+        // by fill (never past the window) and resolved only when playback
+        // reaches it: lookahead may discover a boundary but never crosses it.
+        let pendingSection = -1
+        // consecutive boundary crossings that produced no sentence (empty
+        // sections, e.g. image-only pages); bounded so a pathological book
+        // cannot spin the loop
+        let blankAdvances = 0
 
         const schedule = index => {
             invariant(!entries.has(index), 'index not scheduled twice')
@@ -363,14 +385,26 @@ export class LocalTTSPlayer {
         const fill = async target => {
             invariant(target >= 0, 'fill target is non-negative')
             invariant(entries.size <= this.#synthAhead, 'window not exceeded before fill')
+            // a known boundary blocks all further fetching until playback
+            // reaches it and onSectionEnd pages the renderer
+            if (pendingSection !== -1) return
             while (!run.dead && !sourceDone && scheduled < target) {
                 const s = await source()
                 if (run.dead) return
+                if (s === SECTION_END) {
+                    // hold at the boundary: the next sentence lives in the
+                    // next section, which must not be paged until the audio
+                    // already scheduled has played
+                    if (!onSectionEnd) { sourceDone = true; return }
+                    pendingSection = scheduled + 1
+                    return
+                }
                 if (!s) { sourceDone = true; return }
                 invariant(typeof s.text === 'string', 'source sentence has text')
                 scheduled += 1
                 pending.set(scheduled, s)
                 schedule(scheduled)
+                blankAdvances = 0
                 invariant(entries.size <= this.#synthAhead,
                     'window not exceeded after schedule')
             }
@@ -382,6 +416,24 @@ export class LocalTTSPlayer {
                 invariant(i >= 0, 'playback index non-negative')
                 await fill(i + this.#synthAhead - 1)
                 if (run.dead) break
+                if (pendingSection === i) {
+                    // playback has reached the boundary: now page the
+                    // renderer, then keep pulling from the new section
+                    invariant(!entries.has(i), 'a section boundary has no sentence')
+                    pendingSection = -1
+                    blankAdvances += 1
+                    if (blankAdvances > 64) { sourceDone = true; break }
+                    let advanced = false
+                    try {
+                        advanced = await onSectionEnd()
+                    } catch (e) {
+                        run.dead = true
+                        throw e
+                    }
+                    if (run.dead) break
+                    if (!advanced) { sourceDone = true; break }
+                    continue
+                }
                 // fill either produced sentence i or exhausted the source
                 invariant(entries.has(i) || sourceDone,
                     'fill produced i or ended the source')
