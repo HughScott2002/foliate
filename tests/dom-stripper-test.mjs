@@ -100,6 +100,10 @@ try {
         'noteref marker was spoken: ' + JSON.stringify(text))
     check(!text.includes('42'), 'pagebreak label was spoken: ' + JSON.stringify(text))
     check(!text.includes('Contents entry'), 'toc entry was spoken: ' + JSON.stringify(text))
+    // a <script> in the body must never be serialized into SSML (the walk
+    // rejects it, but the SSML is built from the fragment markup)
+    check(!text.includes('getFragmentWithMarks'),
+        'inline script text was spoken: ' + JSON.stringify(text))
     check(text.includes("O'Reilly style") && text.includes('marker'),
         'prose around a data-type noteref was lost: ' + JSON.stringify(text))
     check(text.includes('Paged') && text.includes('again'),
