@@ -22,7 +22,7 @@ import { formatLanguageMap, formatAuthors, makeBookInfoWindow } from './book-inf
 import { themes, invertTheme, themeCssProvider } from './themes.js'
 import { dataStore, BookData } from './data.js'
 import { VoiceManagerDialog } from './voice-manager.js'
-import { choosePack } from './voice-packs.js'
+import { choosePack, NARRATORS, narratorLabel, resolveNarratorSid } from './voice-packs.js'
 
 // for use in the WebView
 const uiText = {
@@ -73,14 +73,31 @@ const FontSettings = utils.makeDataClass('FoliateFontSettings', {
     'minimum-size': 'double',
 })
 
+export const NarrationSettings = utils.makeDataClass('FoliateNarrationSettings', {
+    'default': 'uint',
+})
+
+// unlike the other settings classes, the GSettings key is not the same as the
+// property name: the global narrator lives under `tts-supertonic-sid`
+NarrationSettings.prototype.bindSettings = function(name = 'viewer') {
+    const s = utils.settings(name)
+    if (!s) return
+    s.bind('tts-supertonic-sid', this, 'default',
+        Gio.SettingsBindFlags.DEFAULT | Gio.SettingsBindFlags.SYNC_CREATE)
+}
+NarrationSettings.prototype.unbindSettings = function() {
+    Gio.Settings.unbind(this, 'default')
+}
+
 const getFamily = str => Pango.FontDescription.from_string(str).get_family()
 
-const ViewPreferencesWindow = GObject.registerClass({
+export const ViewPreferencesWindow = GObject.registerClass({
     GTypeName: 'FoliateViewPreferencesWindow',
     Template: pkg.moduleuri('ui/view-preferences-window.ui'),
     Properties: utils.makeParams({
         'font-settings': 'object',
         'view-settings': 'object',
+        'narration-settings': 'object',
     }),
     InternalChildren: [
         'default-font', 'override-font',
@@ -90,6 +107,7 @@ const ViewPreferencesWindow = GObject.registerClass({
         'max-inline-size', 'max-block-size', 'max-column-count',
         'theme-flow-box',
         'reduce-animation',
+        'default-narrator',
     ],
 }, class extends Adw.PreferencesDialog {
     constructor(params) {
@@ -112,6 +130,10 @@ const ViewPreferencesWindow = GObject.registerClass({
             'max-column-count': [this._max_column_count, 'value'],
             'animated': [this._reduce_animation, 'active', true],
             'override-font': [this._override_font, 'active'],
+        })
+        for (const { sid } of NARRATORS) this._default_narrator.model.append(narratorLabel(sid))
+        this.narration_settings.bindProperties({
+            'default': [this._default_narrator, 'selected'],
         })
 
         const actionGroup = utils.addPropertyActions(this.viewSettings, ['theme'])
@@ -206,6 +228,9 @@ GObject.registerClass({
         'max-column-count': 2,
         'scrolled': false,
         'animated': true,
+    })
+    narrationSettings = new NarrationSettings({
+        'default': 0,
     })
     constructor(params) {
         super(params)
@@ -559,6 +584,13 @@ export const BookViewer = GObject.registerClass({
         utils.bindSettings('viewer', this, ['fold-sidebar', 'highlight-color'])
         this._view.fontSettings.bindSettings('viewer.font')
         this._view.viewSettings.bindSettings('viewer.view')
+        this._view.narrationSettings.bindSettings('viewer')
+        // books that follow the default narrator update live when the
+        // global default changes in Preferences; connected once, after the
+        // bind, so the initial SYNC_CREATE notify does not fire it
+        utils.connectWith(this, this._view.narrationSettings, {
+            'notify::default': () => this.#onGlobalNarratorChanged(),
+        })
         this._view.webView.connect('notify::zoom-level', webView =>
             this._zoom_button.label = format.percent(webView.zoom_level))
         this._zoom_button.label = format.percent(this._view.webView.zoom_level)
@@ -867,6 +899,12 @@ export const BookViewer = GObject.registerClass({
         const tts = this._navbar.tts_box
         tts.language = (Array.isArray(language) ? language[0] : language) || 'en'
         const primary = tts.language.toLowerCase().split(/[-_]/)[0]
+        // apply the book-level narrator before pack setup and warm-up, so
+        // both use the effective Supertonic style
+        tts.setSupertonicSid(resolveNarratorSid({
+            stored: this.#data?.storage.get('tts-supertonic-sid', null) ?? null,
+            globalSid: this._view.narrationSettings.default,
+        }).sid)
         tts.setPack(choosePack({
             saved: this.#data?.storage.get('tts-voice-pack'),
             language: primary,
@@ -874,6 +912,17 @@ export const BookViewer = GObject.registerClass({
         // load the voice model now, in the background, so the first Play has
         // no model-load wait (best effort; see TTSBox.warm)
         tts.warm()
+    }
+    #onGlobalNarratorChanged() {
+        // resolve with the book's current stored SID: a valid book choice
+        // followsDefault=false and is unaffected by global changes
+        const { sid, followsDefault } = resolveNarratorSid({
+            stored: this.#data?.storage.get('tts-supertonic-sid', null) ?? null,
+            globalSid: this._view.narrationSettings.default,
+        })
+        if (!followsDefault) return
+        this._navbar.tts_box.setSupertonicSid(sid)
+        this.#voiceManager?.refreshNarrator(sid, null)
     }
     #showVoices(startAfterSelection = false) {
         if (this.#voiceManager) return
@@ -883,10 +932,26 @@ export const BookViewer = GObject.registerClass({
         // leaving it open would hold a GTK grab and the dialog would not
         // take input
         this._navbar.hideNarration()
+        const narrationSettings = this._view.narrationSettings
+        const storedSid = this.#data?.storage.get('tts-supertonic-sid', null) ?? null
+        const effectiveSid = resolveNarratorSid({
+            stored: storedSid,
+            globalSid: narrationSettings.default,
+        }).sid
         const dialog = new VoiceManagerDialog({
             language: tts.language.split(/[-_]/)[0], selected: tts.pack?.id,
+            effectiveSid, storedSid,
+            getGlobalSid: () => narrationSettings.default,
         })
         this.#voiceManager = dialog
+        dialog.connect('narrator-selected', (_, sid) => {
+            this.#data?.storage.set('tts-supertonic-sid', sid)
+            tts.setSupertonicSid(sid)
+        })
+        dialog.connect('narrator-reset', () => {
+            this.#data?.storage.set('tts-supertonic-sid', null)
+            tts.setSupertonicSid(narrationSettings.default)
+        })
         dialog.connect('voice-selected', (_, pack) => {
             tts.setPack(pack)
             this.#data?.storage.set('tts-voice-pack', pack.id)
@@ -1098,6 +1163,7 @@ export const BookViewer = GObject.registerClass({
         const win = new ViewPreferencesWindow({
             view_settings: this._view.viewSettings,
             font_settings: this._view.fontSettings,
+            narration_settings: this._view.narrationSettings,
         })
         win.present(this.root)
     }
@@ -1123,6 +1189,7 @@ export const BookViewer = GObject.registerClass({
         this._navbar.tts_box.kill()
         this._view.viewSettings.unbindSettings()
         this._view.fontSettings.unbindSettings()
+        this._view.narrationSettings.unbindSettings()
         utils.disconnectWith(this, this.#data.annotations)
         utils.disconnectWith(this, this.#data.bookmarks)
         dataStore.delete(this._view)

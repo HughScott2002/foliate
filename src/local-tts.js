@@ -2,6 +2,11 @@ import GLib from 'gi://GLib'
 import Gio from 'gi://Gio'
 import { packDir } from './voice-packs.js'
 import { getVoiceDaemon } from './voice-daemon.js'
+import {
+    daemonNeedsReconcile, clearDaemonReconcile,
+} from './voice-daemon.js'
+import { ensurePackReady } from './voice-pack-validation.js'
+import { acquireReadLease } from './voice-daemon-gate.js'
 
 // Local neural TTS engine controller: builds the sherpa-onnx-offline-tts
 // command line for a pack, synthesizes one sentence at a time into a
@@ -108,11 +113,12 @@ export const parseWavDuration = path => {
 // the cache key covers everything the audio depends on: the text, the
 // pack, the voice id, and — only where the engine takes it — the language.
 // NUL separators keep fields from blurring into each other ('ab'+'c' must
-// not hash as 'a'+'bc').
+// not hash as 'a'+'bc'). Version the synthesis policy so old audio with the
+// daemon's forced mid-sentence head split is not replayed after the fix.
 export const cacheKey = (text, id, sid, lang) => GLib.compute_checksum_for_bytes(
     GLib.ChecksumType.SHA256, new GLib.Bytes(
         new TextEncoder().encode(
-            `${text}\0${id}\0${sid}${lang ? `\0${lang}` : ''}`)))
+            `wav-v2\0${text}\0${id}\0${sid}${lang ? `\0${lang}` : ''}`)))
 
 // move a completed file into place: same-directory rename, so the engine
 // never leaves a partial file at the cache-visible path
@@ -170,12 +176,38 @@ export const buildEngineArgs = (pack, { wavPath, lang, sid } = {}) => {
 
 export class LocalTTS {
     #cacheDir
+    #daemonOverride
     #proc = null
     #stoppedProc = null
 
-    constructor({ cacheDir } = {}) {
+    constructor({ cacheDir, daemon = null } = {}) {
         this.#cacheDir = cacheDir ?? GLib.build_filenamev(
             [GLib.get_user_cache_dir(), 'foliate', 'tts-wav'])
+        // injection seam for tests: a fake daemon never spawns a process
+        this.#daemonOverride = daemon
+    }
+
+    #daemon() {
+        return this.#daemonOverride ?? getVoiceDaemon()
+    }
+
+    // Readiness gate for the shared daemon: an untrusted or corrupt model
+    // may abort a native engine, so it must be proven in an isolated CLI
+    // probe before the daemon loads it. A structurally valid pack whose
+    // engine binary is missing or whose probe hits a transport failure is
+    // not declared corrupt; only a completed invalid-model verdict is.
+    async #ensureReady(pack, cancellable) {
+        try {
+            await ensurePackReady(pack, { cancellable })
+        } catch (error) {
+            if (cancellable?.is_cancelled())
+                throw new Error('synthesis stopped')
+            if (['invalid-pack', 'pack-missing', 'mutation-in-progress']
+                .includes(error?.code))
+                throw error
+            console.debug(`voice pack readiness check skipped: ${
+                error?.message ?? error}`)
+        }
     }
 
     // Synthesize one sentence into the wav cache and return
@@ -190,14 +222,39 @@ export class LocalTTS {
         const langUsed = lang ?? 'en'
         const keyLang = pack.id === 'supertonic' ? langUsed : null
         const sidUsed = sid ?? pack.sid
+        // the daemon has a [[voices]] entry per pack language only for
+        // supertonic; a language outside pack.languages can only be served
+        // by the CLI engine, which runs the same model with any --lang
+        const langSupported = pack.id !== 'supertonic' ||
+            pack.languages.includes(langUsed.split(/[-_]/)[0].toLowerCase())
         const wavPath = GLib.build_filenamev([this.#cacheDir, `${cacheKey(
             text, pack.id, sidUsed, keyLang)}.wav`])
         if (GLib.file_test(wavPath, GLib.FileTest.IS_REGULAR))
             return { wavPath, duration: parseWavDuration(wavPath) }
         // the foliate-voice daemon keeps models loaded; prefer it when up
         // and fall back to the one-shot CLI engine if it is not (or failed)
-        const daemon = getVoiceDaemon()
-        if (daemon.running && !this.#proc) {
+        const daemon = this.#daemon()
+        // a pack change stopped the daemon: restart it lazily so the next
+        // synthesis reconciles a fresh catalog instead of the old one
+        if (!this.#proc && !daemon.running && !this.#daemonOverride &&
+            daemonNeedsReconcile()) {
+            clearDaemonReconcile()
+            try {
+                await daemon.start()
+            } catch (e) {
+                console.debug(`voice daemon restart skipped: ${e.message}`)
+            }
+        }
+        // a language the daemon cannot serve falls back to the CLI engine
+        // below, but the readiness gate still runs: missing/invalid pack
+        // diagnostics must survive the fallback
+        if (!langSupported && daemon.running && !this.#proc)
+            await this.#ensureReady(pack, cancellable)
+        if (langSupported && daemon.running && !this.#proc) {
+            // validate before the shared daemon loads an untrusted model;
+            // a known-invalid pack must never reach the daemon or retry
+            // through the CLI on the same broken files
+            await this.#ensureReady(pack, cancellable)
             // the cache dir may not exist yet on a fresh session; the
             // daemon writes the wav at partPath and will not create it
             GLib.mkdir_with_parents(this.#cacheDir, 0o755)
@@ -205,7 +262,7 @@ export class LocalTTS {
             const partFile = Gio.File.new_for_path(partPath)
             try {
                 const duration = await daemon.synth(text, partPath, pack,
-                    { lang: langUsed, cancellable })
+                    { lang: langUsed, sid: sidUsed, cancellable })
                 moveFile(partPath, wavPath)
                 return { wavPath, duration }
             } catch (e) {
@@ -230,9 +287,18 @@ export class LocalTTS {
         const argv = [program, ...buildEngineArgs(pack,
             { wavPath: partPath, sid: sidUsed, lang: langUsed }), text]
         GLib.mkdir_with_parents(this.#cacheDir, 0o755)
-        const proc = Gio.Subprocess.new(argv,
-            Gio.SubprocessFlags.STDOUT_SILENCE |
-            Gio.SubprocessFlags.STDERR_PIPE)
+        // hold a read lease across the CLI subprocess: a pack change cannot
+        // replace the model files under a running engine
+        const release = acquireReadLease()
+        let proc
+        try {
+            proc = Gio.Subprocess.new(argv,
+                Gio.SubprocessFlags.STDOUT_SILENCE |
+                Gio.SubprocessFlags.STDERR_PIPE)
+        } catch (error) {
+            release()
+            throw error
+        }
         this.#proc = proc
         try {
             const stderrPromise = drain(proc.get_stderr_pipe())
@@ -293,6 +359,7 @@ export class LocalTTS {
             // the stopped identity was consumed by the failure path above;
             // clear it here so it cannot pin the proc and its stderr fd
             if (this.#stoppedProc === proc) this.#stoppedProc = null
+            release()
         }
     }
 

@@ -524,4 +524,17 @@ export class LocalTTSPlayer {
         // stopAll() before reporting, so nothing survives the callback
         this.#tts.stopAll().catch(() => {})
     }
+
+    // Stop the run and wait for its teardown to settle: the unwinding
+    // play() reports its terminal callback only after the in-flight
+    // synthesis is cancelled and its engine reaped. A pack change or a
+    // chooser transition awaits this before touching model files.
+    async stopAndWait() {
+        const run = this.#run
+        if (!run) return
+        this.stop()
+        try {
+            await run.done
+        } catch { /* the terminal callback reports failures */ }
+    }
 }

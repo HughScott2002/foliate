@@ -5,6 +5,8 @@ import GLib from 'gi://GLib'
 
 const tmp = GLib.dir_make_tmp('foliate-controls-XXXXXX')
 GLib.setenv('XDG_DATA_HOME', tmp, true)
+GLib.setenv('XDG_CACHE_HOME', tmp, true)
+GLib.setenv('XDG_CONFIG_HOME', tmp, true)
 Gtk.init()
 Adw.init()
 globalThis.pkg = {
@@ -33,12 +35,21 @@ backend.selected = 0
 check(box.backend === 'local', 'local backend selector did not switch')
 const speed = [...descendants(box)].find(w => w instanceof Gtk.SpinButton)
 check(speed?.visible && speed.value === 1, 'local speed control missing')
+// Read footnotes is shared content selection: it must stay visible and
+// effective for both backends, not hide with the local-only controls.
+const readNotes = box._read_footnotes
+check(readNotes, 'shared read-footnotes control missing')
+check(readNotes.visible, 'read-footnotes must be visible for the local backend')
+backend.selected = 1
+check(readNotes.visible, 'read-footnotes must stay visible for the system backend')
+backend.selected = 0
+check(readNotes.visible, 'read-footnotes must stay visible after switching back')
 
 const pack = getPacks()[0]
 GLib.mkdir_with_parents(packDir(pack.id), 0o700)
 for (const name of pack.expectedFiles) {
     if (['dict', 'espeak-ng-data'].includes(name)) GLib.mkdir_with_parents(`${packDir(pack.id)}/${name}`, 0o700)
-    else GLib.file_set_contents(`${packDir(pack.id)}/${name}`, '')
+    else GLib.file_set_contents(`${packDir(pack.id)}/${name}`, 'x')
 }
 box.setPack(pack)
 let finishInit
@@ -51,6 +62,152 @@ finishInit()
 await pending
 check(!started && box.state === 'stopped', 'stop during reader init must cancel pending narration')
 deletePack(pack.id)
+
+// --- Supertonic narrator tests with injected fakes ---
+// TTSBox must accept `{ tts, player, daemonRunning }`, key warm-up primers
+// by the effective narrator, pass the book SID to synthesis only for
+// Supertonic, and never stop an active run when the SID changes.
+const supertonic = getPacks().find(p => p.id === 'supertonic')
+const installPack = pack => {
+    GLib.mkdir_with_parents(packDir(pack.id), 0o700)
+    for (const name of pack.expectedFiles) {
+        if (['dict', 'espeak-ng-data'].includes(name))
+            GLib.mkdir_with_parents(`${packDir(pack.id)}/${name}`, 0o700)
+        else GLib.file_set_contents(`${packDir(pack.id)}/${name}`, 'x')
+    }
+}
+const uninstallPack = pack => deletePack(pack.id)
+const fakeTTS = () => {
+    const calls = []
+    return {
+        calls,
+        synth: async (text, pack, opts = {}) => {
+            calls.push(opts)
+            return { wavPath: '/nonexistent/narrator-test.wav' }
+        },
+        stopAll: async () => {},
+    }
+}
+const fakePlayer = () => {
+    const streams = []
+    return {
+        streams,
+        playStream: async (_source, options) => {
+            streams.push(options)
+        },
+        stop: () => {},
+        stopAndWait: async () => {},
+        pause: () => {},
+        resume: () => {},
+        setRate: () => {},
+    }
+}
+const waitMicro = ms => new Promise(resolve =>
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms,
+        () => (resolve(), GLib.SOURCE_REMOVE)))
+installPack(supertonic)
+
+// warm() passes sid: 9 to synth for Supertonic after setSupertonicSid(9),
+// and a later warm after changing the SID synthesizes again.
+{
+    const tts = fakeTTS()
+    const player = fakePlayer()
+    const box = new TTSBox({ tts, player, daemonRunning: () => true })
+    box.setPack(supertonic)
+    box.setSupertonicSid(9)
+    await box.warm()
+    check(tts.calls.length === 1, 'supertonic warm did not synthesize')
+    check(tts.calls[0].sid === 9, `warm synth got sid ${tts.calls[0].sid}, expected 9`)
+    await box.warm()
+    check(tts.calls.length === 1, 'warm must not re-synthesize with the same SID')
+    box.setSupertonicSid(0)
+    await box.warm()
+    check(tts.calls.length === 2,
+        'warm after a SID change must synthesize again, not stay gated by the old pack-id key')
+    box.kill()
+}
+
+// a Supertonic playStream() run's synth path receives the stored SID,
+// and setSupertonicSid never stops an active run
+{
+    const tts = fakeTTS()
+    const player = fakePlayer()
+    const box = new TTSBox({ tts, player, daemonRunning: () => true })
+    box.setPack(supertonic)
+    box.setSupertonicSid(9)
+    box.connect('init', () => ({}))
+    box.connect('start', () => ({ ssml: '<s>Sentence</s>', seq: 0 }))
+    box.connect('parse', () => ({
+        language: 'en', sentences: [{ text: 'Sentence', index: 0 }],
+    }))
+    box.connect('forward', () => null)
+    // playStream pending so the run stays active while the SID changes
+    let releaseStream
+    const gate = new Promise(resolve => { releaseStream = resolve })
+    player.playStream = (_source, options) => {
+        player.streams.push(options)
+        return gate
+    }
+    const run = box.start()
+    await waitMicro(20)
+    check(player.streams.length === 1, 'start did not hand the source to playStream')
+    check(player.streams[0].voice === 9,
+        `Supertonic run must pass voice 9, got ${player.streams[0].voice}`)
+    // the new SID applies only to the next start: the run is untouched
+    check(box.state === 'playing', 'run must be playing before the SID change')
+    box.setSupertonicSid(2)
+    check(box.state === 'playing',
+        'setSupertonicSid must not stop an active run')
+    check(player.streams[0].voice === 9,
+        'setSupertonicSid must not change an already-started run')
+    releaseStream()
+    await run
+    check(box.state === 'stopped', 'run must end cleanly')
+    // the next start carries the new SID
+    player.playStream = (_source, options) => {
+        player.streams.push(options)
+        return Promise.resolve()
+    }
+    player.streams = []
+    await box.start()
+    check(player.streams.length === 1, 'next run did not start')
+    check(player.streams[0].voice === 2,
+        `next run must carry the new SID, got ${player.streams[0].voice}`)
+    box.kill()
+}
+uninstallPack(supertonic)
+
+// Kokoro and Piper synth calls must not receive a sid property: their pack
+// SID (23 / 0) still applies — warm() and playStream passes alike
+{
+    const kokoro = getPacks().find(p => p.id === 'kokoro')
+    installPack(kokoro)
+    const piper = getPacks().find(p => p.id === 'piper')
+    installPack(piper)
+    for (const pack of [kokoro, piper]) {
+        const tts = fakeTTS()
+        const player = fakePlayer()
+        const box = new TTSBox({ tts, player, daemonRunning: () => true })
+        box.setPack(pack)
+        box.setSupertonicSid(9)
+        await box.warm()
+        check(tts.calls.length === 1, `${pack.id} warm did not synthesize`)
+        check(!('sid' in tts.calls[0]),
+            `${pack.id} warm synth must not receive a sid property`)
+        // a Supertonic narrator change must not re-warm other engines
+        box.setSupertonicSid(4)
+        await box.warm()
+        check(tts.calls.length === 1,
+            `${pack.id} warm must not re-warm after a Supertonic SID change`)
+        await box.start()
+        check(player.streams.length === 1, `${pack.id} run did not start`)
+        check(!('voice' in player.streams[0]),
+            `${pack.id} playStream must not receive a voice option`)
+        box.kill()
+        uninstallPack(pack)
+    }
+}
+uninstallPack(supertonic)
 
 const builder = Gtk.Builder.new_from_string('<interface><object class="FoliateNavBar" id="nav"/></interface>', -1)
 const nav = builder.get_object('nav')

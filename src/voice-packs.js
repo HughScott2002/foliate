@@ -1,9 +1,42 @@
 import GLib from 'gi://GLib'
 import Gio from 'gi://Gio'
 import Soup from 'gi://Soup?version=3.0'
+import { gettext as _ } from 'gettext'
 
 // Voice packs for local neural TTS. Each entry describes a downloadable
 // model tarball (sherpa-onnx) unpacked under the app's data dir.
+
+// Canonical Supertonic 3 narrator catalogue. SID order is the model's
+// voice.bin index; presets are the official style file codes. The names are
+// Foliate labels and the descriptions follow Supertonic's voice guide.
+// gettext calls stay literal here so translation extraction can find them.
+export const NARRATORS = [
+    { sid: 0, preset: 'f1', name: _('Amy'), description: _('Calm and steady') },
+    { sid: 1, preset: 'f2', name: _('Lily'), description: _('Bright and playful') },
+    { sid: 2, preset: 'f3', name: _('Clara'), description: _('Clear announcer') },
+    { sid: 3, preset: 'f4', name: _('Vivian'), description: _('Crisp and confident') },
+    { sid: 4, preset: 'f5', name: _('Grace'), description: _('Kind and gentle') },
+    { sid: 5, preset: 'm1', name: _('Leo'), description: _('Lively and upbeat') },
+    { sid: 6, preset: 'm2', name: _('Graham'), description: _('Deep and composed') },
+    { sid: 7, preset: 'm3', name: _('Victor'), description: _('Authoritative and polished') },
+    { sid: 8, preset: 'm4', name: _('Elliot'), description: _('Gentle and friendly') },
+    { sid: 9, preset: 'm5', name: _('Theo'), description: _('Warm storyteller') },
+]
+
+const narratorFor = sid => Number.isInteger(sid) ? NARRATORS[sid] : undefined
+
+export const narratorLabel = sid => {
+    const { name, description } = narratorFor(sid) ?? NARRATORS[0]
+    return `${name} — ${description}`
+}
+
+export const presetCodeForSid = sid =>
+    (narratorFor(sid) ?? NARRATORS[0]).preset
+
+export const resolveNarratorSid = ({ stored = null, globalSid = null } = {}) => {
+    if (narratorFor(stored)) return { sid: stored, followsDefault: false }
+    return { sid: narratorFor(globalSid) ? globalSid : 0, followsDefault: true }
+}
 
 // Data dir: ~/.local/share/foliate/voices/<id> per the plan spec — this
 // deliberately does NOT mirror pkg.datadir ('com.github.johnfactotum.Foliate').
@@ -99,19 +132,63 @@ export const packDir = id => {
 export const getInstalledPacks = () => getPacks().filter(verifyPack)
 
 // A pack is verified if every expected entry exists as a regular file or
-// directory inside the unpacked pack directory.
-const verifyDirectory = (pack, dir) => {
+// directory inside the unpacked pack directory. Regular files must also be
+// non-empty: a zero-byte model or token table is the known corruption
+// signature this check exists to catch. This is layout/integrity only, not
+// proof that sherpa-onnx can load the model at runtime.
+const DIRECTORY_ENTRIES = new Set(['dict', 'espeak-ng-data'])
+const inspectDirectory = (pack, dir) => {
     const root = Gio.File.new_for_path(dir)
-    if (root.query_file_type(Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
-        !== Gio.FileType.DIRECTORY) return false
-    return pack.expectedFiles.every(name => {
-        const type = root.resolve_relative_path(name).query_file_type(
-            Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
-        return type === (['dict', 'espeak-ng-data'].includes(name)
-            ? Gio.FileType.DIRECTORY : Gio.FileType.REGULAR)
-    })
+    let type
+    try {
+        type = root.query_file_type(Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+    } catch {
+        return { valid: false, message: 'Voice pack directory cannot be read.' }
+    }
+    if (type !== Gio.FileType.DIRECTORY)
+        return { valid: false, message: 'Voice pack path is not a directory.' }
+    const problems = []
+    for (const name of pack.expectedFiles) {
+        const wantsDirectory = DIRECTORY_ENTRIES.has(name)
+        try {
+            const info = root.resolve_relative_path(name).query_info(
+                'standard::type,standard::size',
+                Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+            const actual = info.get_file_type()
+            if (actual !== (wantsDirectory
+                ? Gio.FileType.DIRECTORY : Gio.FileType.REGULAR)) {
+                problems.push(`${name} is not a ${wantsDirectory
+                    ? 'directory' : 'regular file'}`)
+                continue
+            }
+            if (!wantsDirectory && info.get_size() === 0)
+                problems.push(`${name} is empty`)
+        } catch {
+            problems.push(`${name} is missing`)
+        }
+    }
+    return {
+        valid: problems.length === 0,
+        message: problems.length
+            ? `Voice pack is incomplete: ${problems.join('; ')}` : null,
+    }
 }
+const verifyDirectory = (pack, dir) => inspectDirectory(pack, dir).valid
 export const verifyPack = pack => verifyDirectory(pack, packDir(pack.id))
+
+// Cheap synchronous state for the chooser: installed means the pack layout
+// and integrity checks pass, not that the backend has loaded the model.
+// Missing means the pack directory is absent; an existing but incomplete or
+// empty directory is invalid and repairable.
+export const getPackState = pack => {
+    const dir = packDir(pack.id)
+    if (!Gio.File.new_for_path(dir).query_exists(null))
+        return { status: 'missing', message: null }
+    const { valid, message } = inspectDirectory(pack, dir)
+    return valid
+        ? { status: 'installed', message: null }
+        : { status: 'invalid', message }
+}
 
 // gjs 1.86 does not promise-wrap introspection methods whose callback
 // parameter is nullable — every libsoup async call is shaped that way —
@@ -137,24 +214,17 @@ const SIZE_CHUNK = 64 * 1024
 const activeDownloads = new Set()
 
 // Stream to a unique temporary file, verify the pinned checksum, extract to
-// a staging directory, validate its layout, then rename atomically. Never
-// expose a partially extracted pack or overwrite an existing model. Failed
-// or cancelled jobs reap tar before cleaning only their own staging files.
-export const download = async (pack, onProgress = null, cancellable = null) => {
-    const dir = packDir(pack.id)
-    if (!/^[0-9a-f]{64}$/i.test(pack.sha256 ?? ''))
-        throw new Error(`Missing pinned checksum for ${pack.id}`)
-    if (activeDownloads.has(pack.id))
-        throw new Error(`A download is already in progress for ${pack.id}`)
-    const packDirFile = Gio.File.new_for_path(dir)
-    if (packDirFile.query_exists(null))
-        throw new Error(`Voice directory already exists: ${pack.id}. Remove it before downloading again.`)
-    const staging = Gio.File.new_for_path(`${dir}.staging-${GLib.uuid_string_random()}`)
+// a staging directory, and validate its layout. Returns the staging file
+// without publishing it. Failed or cancelled jobs reap tar and clean only
+// their own staging files. Callers own activeDownloads and publication.
+const stagePack = async (pack, dir, onProgress = null, cancellable = null) => {
+    const staging = Gio.File.new_for_path(
+        `${dir}.staging-${GLib.uuid_string_random()}`)
     const part = Gio.File.new_for_path(`${staging.get_path()}.part`)
-    activeDownloads.add(pack.id)
     let out = null
     let unpack = null
     let body = null
+    let keep = false
     try {
         try { part.get_parent().make_directory_with_parents(null) } catch (error) {
             if (error.code !== Gio.IOErrorEnum.EXISTS) throw error
@@ -213,7 +283,8 @@ export const download = async (pack, onProgress = null, cancellable = null) => {
         if (!verifyDirectory(pack, staging.get_path()))
             throw new Error(`unpacked ${pack.id} is missing expected files`)
         cancellable?.set_error_if_cancelled()
-        staging.move(packDirFile, Gio.FileCopyFlags.NONE, null, null)
+        keep = true
+        return staging
     } catch (error) {
         // a cancelled wait leaves tar running: stop it before deleting the
         // files it may still be extracting
@@ -228,9 +299,94 @@ export const download = async (pack, onProgress = null, cancellable = null) => {
         try { body?.close(null) } catch { /* ignore */ }
         try { out?.close(null) } catch { /* ignore */ }
         try { part.delete(null) } catch { /* nothing staged */ }
+        if (!keep) {
+            try {
+                if (staging.query_exists(null)) deleteFile(staging)
+            } catch { /* nothing staged */ }
+        }
+    }
+}
+
+const cleanupStaging = staging => {
+    try {
+        if (staging?.query_exists(null)) deleteFile(staging)
+    } catch { /* nothing staged */ }
+}
+
+// Stream to a unique temporary file, verify the pinned checksum, extract to
+// a staging directory, validate its layout, then rename atomically. Never
+// expose a partially extracted pack or overwrite an existing model. Failed
+// or cancelled jobs reap tar before cleaning only their own staging files.
+export const download = async (pack, onProgress = null, cancellable = null) => {
+    const dir = packDir(pack.id)
+    if (!/^[0-9a-f]{64}$/i.test(pack.sha256 ?? ''))
+        throw new Error(`Missing pinned checksum for ${pack.id}`)
+    if (activeDownloads.has(pack.id))
+        throw new Error(`A download is already in progress for ${pack.id}`)
+    const packDirFile = Gio.File.new_for_path(dir)
+    if (packDirFile.query_exists(null))
+        throw new Error(`Voice directory already exists: ${pack.id}. Remove it before downloading again.`)
+    activeDownloads.add(pack.id)
+    let staging = null
+    try {
+        staging = await stagePack(pack, dir, onProgress, cancellable)
+        // keep the refusal friendly if another process created the target
+        if (packDirFile.query_exists(null))
+            throw new Error(`Voice directory already exists: ${pack.id}. Remove it before downloading again.`)
+        staging.move(packDirFile, Gio.FileCopyFlags.NONE, null, null)
+        staging = null
+    } finally {
+        cleanupStaging(staging)
+        activeDownloads.delete(pack.id)
+    }
+}
+
+// Repair a missing or invalid pack without ever publishing a partial one.
+// The archive checksum and unpacked layout are verified in staging before the
+// current directory is moved aside. On success the previous directory stays
+// as a uniquely named backup; on cancellation or failure the previous
+// directory (or its backup) is left intact. The caller owns the explicit
+// destructive confirmation and must settle in-flight backend use first.
+export const repairPack = async (pack, onProgress = null, cancellable = null) => {
+    const dir = packDir(pack.id)
+    if (!/^[0-9a-f]{64}$/i.test(pack.sha256 ?? ''))
+        throw new Error(`Missing pinned checksum for ${pack.id}`)
+    if (activeDownloads.has(pack.id))
+        throw new Error(`A download is already in progress for ${pack.id}`)
+    activeDownloads.add(pack.id)
+    const dirFile = Gio.File.new_for_path(dir)
+    let staging = null
+    try {
+        staging = await stagePack(pack, dir, onProgress, cancellable)
+        let backup = null
+        let movedAside = false
         try {
-            if (staging.query_exists(null)) deleteFile(staging)
-        } finally { activeDownloads.delete(pack.id) }
+            if (dirFile.query_exists(null)) {
+                backup = Gio.File.new_for_path(
+                    `${dir}.backup-${GLib.uuid_string_random()}`)
+                dirFile.move(backup, Gio.FileCopyFlags.NONE, null, null)
+                movedAside = true
+            }
+            cancellable?.set_error_if_cancelled()
+            staging.move(dirFile, Gio.FileCopyFlags.NONE, null, null)
+            staging = null
+        } catch (error) {
+            let rollbackNote = ''
+            if (movedAside) {
+                try {
+                    backup.move(dirFile, Gio.FileCopyFlags.NONE, null, null)
+                } catch (rollbackError) {
+                    rollbackNote = `; rollback failed, previous pack kept at ` +
+                        `${backup.get_path()}: ${rollbackError.message}`
+                }
+            }
+            if (rollbackNote)
+                throw new Error(`${error.message}${rollbackNote}`)
+            throw error
+        }
+    } finally {
+        cleanupStaging(staging)
+        activeDownloads.delete(pack.id)
     }
 }
 

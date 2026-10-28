@@ -13,7 +13,9 @@ import {
     packDir,
     verifyPack,
     getInstalledPacks,
+    getPackState,
     download,
+    repairPack,
     deletePack,
 } from '../src/voice-packs.js'
 
@@ -22,6 +24,76 @@ const assert = (cond, msg) => {
     if (cond) return
     failures++
     printerr(`FAIL: ${msg}`)
+}
+
+// read one UTF-8 text fixture or installed-pack file
+const readText = path =>
+    new TextDecoder().decode(Gio.File.new_for_path(path).load_contents(null)[1])
+
+// names of repair backups retained beside the installed pack directory
+const backupsFor = id => {
+    const parent = Gio.File.new_for_path(packDir(id)).get_parent()
+    const children = parent.enumerate_children(
+        'standard::name', Gio.FileQueryInfoFlags.NONE, null)
+    const found = []
+    try {
+        let info
+        while ((info = children.next_file(null)) != null) {
+            const name = info.get_name()
+            if (name.startsWith(`${id}.backup-`))
+                found.push(parent.get_child(name).get_path())
+        }
+    } finally {
+        children.close(null)
+    }
+    return found
+}
+
+// staging and .part siblings left by a repair attempt
+const stagingFor = id => {
+    const parent = Gio.File.new_for_path(packDir(id)).get_parent()
+    const children = parent.enumerate_children(
+        'standard::name', Gio.FileQueryInfoFlags.NONE, null)
+    const found = []
+    try {
+        let info
+        while ((info = children.next_file(null)) != null) {
+            const name = info.get_name()
+            if (name.startsWith(`${id}.staging-`))
+                found.push(parent.get_child(name).get_path())
+        }
+    } finally {
+        children.close(null)
+    }
+    return found
+}
+
+// Inject one deterministic Gio.File.move failure for an isolated repair case.
+// The predicate sees the source and destination; returning true throws and
+// records that the intended fault fired. The real method is always restored.
+const withMoveFault = async (predicate, body) => {
+    const original = Gio.File.prototype.move
+    const fired = []
+    Gio.File.prototype.move = function (destination, ...rest) {
+        if (predicate(this, destination)) {
+            fired.push({
+                source: this.get_path(),
+                destination: destination?.get_path?.(),
+            })
+            throw new Error('injected move failure')
+        }
+        return original.call(this, destination, ...rest)
+    }
+    let result
+    let error = null
+    try {
+        result = await body()
+    } catch (caught) {
+        error = caught
+    } finally {
+        Gio.File.prototype.move = original
+    }
+    return { result, error, fired }
 }
 
 // recursive delete for cleanup in the finally block below
@@ -69,6 +141,33 @@ const [fixtureBytes] = Gio.File.new_for_path(tarball).load_bytes(null)
 const fixtureSha =
     GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256, fixtureBytes)
 assert(/^[0-9a-f]{64}$/.test(fixtureSha), 'fixture sha256 computed')
+
+// a second tarball with a valid checksum but a missing expected file:
+// repair must reject its layout before replacing the old pack
+const badLayout = GLib.build_filenamev([www, 'stub-badlayout'])
+GLib.mkdir_with_parents(
+    GLib.build_filenamev([badLayout, 'espeak-ng-data']), 0o755)
+GLib.mkdir_with_parents(GLib.build_filenamev([badLayout, 'dict']), 0o755)
+const putBad = (name, content) =>
+    GLib.file_set_contents(GLib.build_filenamev([badLayout, name]), content)
+putBad('voices.bin', 'x')
+putBad('tokens.txt', 'a b c')
+putBad('lexicon-us-en.txt', 'a=a')
+putBad('lexicon-gb-en.txt', 'a=a')
+putBad('lexicon-zh.txt', 'a=a')
+GLib.file_set_contents(
+    GLib.build_filenamev([badLayout, 'espeak-ng-data', 'marker']), 'x')
+const badLayoutTarball =
+    GLib.build_filenamev([www, 'stub-badlayout.tar.bz2'])
+assert(Gio.Subprocess.new(
+    ['tar', '-cjf', badLayoutTarball, '-C', www, 'stub-badlayout'],
+    Gio.SubprocessFlags.NONE).wait_check(null) === true,
+'bad-layout fixture tarball built')
+const [badLayoutBytes] =
+    Gio.File.new_for_path(badLayoutTarball).load_bytes(null)
+const badLayoutSha =
+    GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256, badLayoutBytes)
+assert(/^[0-9a-f]{64}$/.test(badLayoutSha), 'bad-layout sha256 computed')
 
 // pick a free port, then serve the fixture directory over loopback http
 const probe = Gio.Socket.new(Gio.SocketFamily.IPV4, Gio.SocketType.STREAM,
@@ -223,6 +322,202 @@ try {
         assert(!GLib.file_test(packDir('badsum'), GLib.FileTest.EXISTS),
             'no pack dir after a checksum failure')
     }
+
+    // repair a missing pack: no previous directory, so no backup is kept
+    const missingId = 'repair-missing'
+    const missingEntry = { ...stubPack, id: missingId }
+    assert(getPackState(missingEntry).status === 'missing',
+        'repair target starts missing')
+    await repairPack(missingEntry)
+    assert(verifyPack(missingEntry) === true, 'repair installs a missing pack')
+    assert(getPackState(missingEntry).status === 'installed',
+        'repaired missing pack reports installed')
+    assert(backupsFor(missingId).length === 0,
+        'repairing a missing pack creates no backup')
+    assert(deletePack(missingId) === true, 'repaired missing pack deleted')
+
+    // repair an invalid pack: old bytes survive in a unique retained backup
+    const installedId = 'repair-installed'
+    const installedEntry = { ...stubPack, id: installedId }
+    GLib.mkdir_with_parents(packDir(installedId), 0o755)
+    GLib.file_set_contents(`${packDir(installedId)}/tokens.txt`, 'old tokens')
+    GLib.file_set_contents(`${packDir(installedId)}/model.int8.onnx`, '')
+    assert(getPackState(installedEntry).status === 'invalid',
+        'repair target starts invalid')
+    await repairPack(installedEntry)
+    assert(verifyPack(installedEntry) === true, 'repair replaces invalid content')
+    assert(getPackState(installedEntry).status === 'installed',
+        'repaired pack reports installed')
+    const installedBackups = backupsFor(installedId)
+    assert(installedBackups.length === 1,
+        `repair keeps one previous-directory backup (got ${installedBackups.length})`)
+    assert(readText(`${installedBackups[0]}/tokens.txt`) === 'old tokens',
+        'backup keeps the previous pack bytes')
+    assert(readText(`${packDir(installedId)}/tokens.txt`) === 'a b c',
+        'repaired pack carries the verified archive bytes')
+    assert(stagingFor(installedId).length === 0,
+        'repair leaves no staging directory behind')
+    assert(deletePack(installedId) === true, 'repaired installed pack deleted')
+
+    // a checksum failure during repair leaves the previous directory intact
+    const badsumRepairId = 'repair-badsum'
+    GLib.mkdir_with_parents(packDir(badsumRepairId), 0o755)
+    GLib.file_set_contents(
+        `${packDir(badsumRepairId)}/tokens.txt`, 'keep checksum repair')
+    try {
+        await repairPack({ ...stubPack, id: badsumRepairId,
+            sha256: '0'.repeat(64) })
+        failures++
+        printerr('FAIL: a repair with a bad checksum should reject')
+    } catch (error) {
+        assert(/checksum/i.test(error.message),
+            `repair checksum failure reports the mismatch (got: ${error.message})`)
+    }
+    assert(readText(`${packDir(badsumRepairId)}/tokens.txt`)
+        === 'keep checksum repair', 'failed repair keeps the previous bytes')
+    assert(backupsFor(badsumRepairId).length === 0,
+        'failed checksum repair creates no backup')
+    assert(stagingFor(badsumRepairId).length === 0,
+        'failed checksum repair leaves no staging directory')
+    assert(deletePack(badsumRepairId) === true, 'failed repair target deleted')
+
+    // cancelling a repair mid-download leaves the previous directory intact
+    const cancelRepairId = 'repair-cancel'
+    GLib.mkdir_with_parents(packDir(cancelRepairId), 0o755)
+    GLib.file_set_contents(
+        `${packDir(cancelRepairId)}/tokens.txt`, 'keep cancelled repair')
+    const repairCancellable = new Gio.Cancellable()
+    let repairProgressCalls = 0
+    try {
+        await repairPack({ ...stubPack, id: cancelRepairId }, () => {
+            if (++repairProgressCalls === 1) repairCancellable.cancel()
+        }, repairCancellable)
+        failures++
+        printerr('FAIL: a cancelled repair should reject')
+    } catch (error) {
+        assert(/cancel/i.test(error.message),
+            `cancelled repair rejects with a cancel error (got: ${error.message})`)
+    }
+    assert(repairProgressCalls >= 1,
+        'repair progress fired before the cancel landed')
+    assert(readText(`${packDir(cancelRepairId)}/tokens.txt`)
+        === 'keep cancelled repair', 'cancelled repair keeps the previous bytes')
+    assert(backupsFor(cancelRepairId).length === 0,
+        'cancelled repair creates no backup')
+    assert(stagingFor(cancelRepairId).length === 0,
+        'cancelled repair leaves no staging directory')
+    assert(deletePack(cancelRepairId) === true, 'cancelled repair target deleted')
+
+    // a valid checksum with an incomplete layout is rejected before replacement
+    const layoutRepairId = 'repair-layout'
+    GLib.mkdir_with_parents(packDir(layoutRepairId), 0o755)
+    GLib.file_set_contents(
+        `${packDir(layoutRepairId)}/tokens.txt`, 'keep layout repair')
+    try {
+        await repairPack({ ...stubPack, id: layoutRepairId,
+            sha256: badLayoutSha,
+            url: `http://127.0.0.1:${port}/stub-badlayout.tar.bz2` })
+        failures++
+        printerr('FAIL: a repair with an incomplete layout should reject')
+    } catch (error) {
+        assert(/missing expected files/i.test(error.message),
+            `repair layout failure names missing files (got: ${error.message})`)
+    }
+    assert(readText(`${packDir(layoutRepairId)}/tokens.txt`)
+        === 'keep layout repair', 'layout failure keeps the previous bytes')
+    assert(backupsFor(layoutRepairId).length === 0,
+        'layout failure creates no backup')
+    assert(stagingFor(layoutRepairId).length === 0,
+        'layout failure leaves no staging directory')
+    assert(deletePack(layoutRepairId) === true, 'layout failure target deleted')
+
+    // failure moving the old pack to its backup leaves the original in place
+    const backupFaultId = 'repair-backup-fault'
+    GLib.mkdir_with_parents(packDir(backupFaultId), 0o755)
+    GLib.file_set_contents(
+        `${packDir(backupFaultId)}/tokens.txt`, 'keep backup fault')
+    const backupFault = await withMoveFault(
+        (source, destination) =>
+            source.get_path() === packDir(backupFaultId) &&
+            destination?.get_path?.().startsWith(
+                `${packDir(backupFaultId)}.backup-`),
+        () => repairPack({ ...stubPack, id: backupFaultId }))
+    assert(backupFault.fired.length === 1,
+        'injected fault fired while moving the old pack to backup')
+    assert(backupFault.error instanceof Error,
+        'failed move to backup rejects repairPack')
+    assert(/injected move failure/i.test(backupFault.error.message),
+        `failed move to backup reports the injected fault (got: ${backupFault.error.message})`)
+    assert(readText(`${packDir(backupFaultId)}/tokens.txt`)
+        === 'keep backup fault', 'old bytes survive a failed move to backup')
+    assert(backupsFor(backupFaultId).length === 0,
+        'failed move to backup leaves no backup directory')
+    assert(stagingFor(backupFaultId).length === 0,
+        'failed move to backup cleans staging')
+    assert(getPackState({ ...stubPack, id: backupFaultId }).status === 'invalid',
+        'failed backup move leaves the original invalid pack in place')
+    assert(deletePack(backupFaultId) === true, 'backup-fault target deleted')
+
+    // failure publishing staging after the backup succeeded restores the old pack
+    const publishFaultId = 'repair-publish-fault'
+    GLib.mkdir_with_parents(packDir(publishFaultId), 0o755)
+    GLib.file_set_contents(
+        `${packDir(publishFaultId)}/tokens.txt`, 'keep publish fault')
+    const publishFault = await withMoveFault(
+        (source, destination) =>
+            source.get_path().startsWith(`${packDir(publishFaultId)}.staging-`) &&
+            destination?.get_path?.() === packDir(publishFaultId),
+        () => repairPack({ ...stubPack, id: publishFaultId }))
+    assert(publishFault.fired.length === 1,
+        'injected fault fired while publishing staging after backup succeeded')
+    assert(publishFault.error instanceof Error,
+        'failed staging publication rejects repairPack')
+    assert(/injected move failure/i.test(publishFault.error.message),
+        `failed staging publication reports the injected fault (got: ${publishFault.error.message})`)
+    assert(readText(`${packDir(publishFaultId)}/tokens.txt`)
+        === 'keep publish fault', 'old bytes restored after failed staging publication')
+    assert(getPackState({ ...stubPack, id: publishFaultId }).status === 'invalid',
+        'restored pack is still the original invalid pack')
+    assert(backupsFor(publishFaultId).length === 0,
+        'successful rollback leaves no backup directory')
+    assert(stagingFor(publishFaultId).length === 0,
+        'failed staging publication cleans staging')
+    assert(deletePack(publishFaultId) === true, 'publish-fault target deleted')
+
+    // failure rolling back retains the backup and reports its recoverable path
+    const rollbackFaultId = 'repair-rollback-fault'
+    GLib.mkdir_with_parents(packDir(rollbackFaultId), 0o755)
+    GLib.file_set_contents(
+        `${packDir(rollbackFaultId)}/tokens.txt`, 'keep rollback fault')
+    const rollbackFault = await withMoveFault(
+        (source, destination) => {
+            const from = source.get_path()
+            const to = destination?.get_path?.()
+            return (from.startsWith(`${packDir(rollbackFaultId)}.staging-`) &&
+                    to === packDir(rollbackFaultId)) ||
+                (from.startsWith(`${packDir(rollbackFaultId)}.backup-`) &&
+                    to === packDir(rollbackFaultId))
+        },
+        () => repairPack({ ...stubPack, id: rollbackFaultId }))
+    assert(rollbackFault.fired.length === 2,
+        'injected faults fired for staging publication and rollback')
+    assert(rollbackFault.error instanceof Error,
+        'failed rollback rejects repairPack')
+    assert(/rollback failed/i.test(rollbackFault.error.message),
+        `failed rollback is reported (got: ${rollbackFault.error.message})`)
+    const rollbackBackups = backupsFor(rollbackFaultId)
+    assert(rollbackBackups.length === 1,
+        'failed rollback retains exactly one backup')
+    assert(rollbackFault.error.message.includes(rollbackBackups[0]),
+        'failed rollback reports the recoverable backup path')
+    assert(readText(`${rollbackBackups[0]}/tokens.txt`)
+        === 'keep rollback fault', 'old bytes survive in the retained backup')
+    assert(!GLib.file_test(packDir(rollbackFaultId), GLib.FileTest.EXISTS),
+        'failed rollback leaves the original path absent')
+    assert(stagingFor(rollbackFaultId).length === 0,
+        'failed rollback cleans staging')
+    assert(deletePack(rollbackFaultId) === false,
+        'failed rollback leaves no installed directory to delete')
 
     // a non-tarball body passes the download checks but fails the unpack:
     // the staging directory created for it must not survive

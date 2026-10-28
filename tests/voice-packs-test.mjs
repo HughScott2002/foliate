@@ -12,6 +12,7 @@ import {
     packDir,
     verifyPack,
     getInstalledPacks,
+    getPackState,
     download,
     deletePack,
 } from '../src/voice-packs.js'
@@ -81,28 +82,77 @@ assert(installed.every(p => knownIds.includes(p.id)),
 assert(!installed.some(p => p.id === 'kokoro'),
     'kokoro not reported installed before download')
 
+const kokoroPack = packs.find(p => p.id === 'kokoro')
+const piperPack = packs.find(p => p.id === 'piper')
+
+// getPackState distinguishes an absent directory from an existing empty one
+assert(getPackState(piperPack).status === 'missing',
+    'getPackState reports a missing pack directory')
+assert(getPackState(piperPack).message === null,
+    'missing pack state has no diagnostic message')
+
+const emptyDir = Gio.File.new_for_path(packDir('piper'))
+emptyDir.make_directory_with_parents(null)
+assert(verifyPack(piperPack) === false, 'verifyPack false for an empty pack dir')
+const emptyState = getPackState(piperPack)
+assert(emptyState.status === 'invalid',
+    'getPackState reports an existing empty pack as invalid')
+assert(typeof emptyState.message === 'string' && emptyState.message.length > 0,
+    'invalid pack state carries a diagnostic message')
+
+// a regular file where the pack directory belongs is invalid, not missing
+const stray = Gio.File.new_for_path(packDir('not-a-real-pack'))
+GLib.file_set_contents(stray.get_path(), 'not a pack directory')
+const strayPack = { ...kokoroPack, id: 'not-a-real-pack' }
+const strayState = getPackState(strayPack)
+assert(strayState.status === 'invalid',
+    'getPackState reports a non-directory pack path as invalid')
+assert(typeof strayState.message === 'string',
+    'non-directory pack state carries a diagnostic message')
+assert(verifyPack(strayPack) === false,
+    'verifyPack false for a non-directory pack path')
+stray.delete(null)
+
 // full install -> verify -> delete cycle (runs in the temp XDG_DATA_HOME)
-const kokoroPack = packs[0]
 const dir = Gio.File.new_for_path(packDir('kokoro'))
 dir.make_directory_with_parents(null)
 // 'dict' and 'espeak-ng-data' ship as directories in the tarball
 const DIRS = new Set(['espeak-ng-data', 'dict'])
 for (const name of kokoroPack.expectedFiles) {
     if (DIRS.has(name)) dir.get_child(name).make_directory(null)
-    else dir.get_child(name).create(Gio.FileCreateFlags.NONE, null).close(null)
+    else GLib.file_set_contents(
+        dir.get_child(name).get_path(), 'placeholder model data')
 }
 assert(verifyPack(kokoroPack) === true, 'verifyPack true with all files present')
+const installedState = getPackState(kokoroPack)
+assert(installedState.status === 'installed',
+    'getPackState reports a complete pack as installed')
+assert(installedState.message === null,
+    'installed pack state has no diagnostic message')
 assert(getInstalledPacks().some(p => p.id === 'kokoro'),
     'getInstalledPacks() sees the installed pack')
 
-// an empty dir must not pass verifyPack (expected files make it real)
-const emptyDir = Gio.File.new_for_path(packDir('piper'))
-emptyDir.make_directory_with_parents(null)
-assert(verifyPack(packs.find(p => p.id === 'piper')) === false,
-    'verifyPack false for an empty pack dir')
+// zero-byte required files are the known corruption signature: invalid
+GLib.file_set_contents(dir.get_child('tokens.txt').get_path(), '')
+assert(verifyPack(kokoroPack) === false,
+    'verifyPack rejects a zero-byte required file')
+const corruptState = getPackState(kokoroPack)
+assert(corruptState.status === 'invalid',
+    'getPackState reports zero-byte required files as invalid')
+assert(/empty/i.test(corruptState.message),
+    `invalid state names the empty file (got: ${corruptState.message})`)
+assert(!getInstalledPacks().some(p => p.id === 'kokoro'),
+    'getInstalledPacks() drops a pack with zero-byte required files')
+
+// restoring nonempty content recovers the installed state
+GLib.file_set_contents(dir.get_child('tokens.txt').get_path(), 'tokens')
+assert(getPackState(kokoroPack).status === 'installed',
+    'getPackState returns installed after the empty file is fixed')
 
 assert(deletePack('kokoro') === true, 'deletePack removes the installed pack')
 assert(verifyPack(kokoroPack) === false, 'verifyPack false again after delete')
+assert(getPackState(kokoroPack).status === 'missing',
+    'getPackState returns missing after delete')
 
 // deleting a missing pack must not throw
 assert(deletePack('not-a-real-pack') === false,

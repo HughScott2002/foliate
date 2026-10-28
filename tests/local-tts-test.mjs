@@ -283,6 +283,35 @@ assert(supertonicArgsSeen.some(arg => arg === '--sid=0'),
     'supertonic default sid passes through')
 assert(runCount() === 4, 'supertonic synth ran the engine')
 
+// supertonic narrator override: a different sid is a different voice, so it
+// must reach the CLI flags and fork the cache entry
+await tts.synth('Hello world.', supertonicPack, { lang: 'de', sid: 9 })
+assert(argsLast().some(arg => arg === '--sid=9'),
+    'supertonic narrator sid reaches the CLI flags')
+assert(runCount() === 5, 'supertonic narrator sid changes the cache key')
+
+// A pre-fix cache entry contains the daemon's forced mid-sentence pause.
+// Leave it on disk, but synthesize fresh audio rather than replaying it.
+{
+    const text = 'Business, when a company is acquired for its actual business (revenue and earnings).'
+    const legacyKey = GLib.compute_checksum_for_bytes(GLib.ChecksumType.SHA256,
+        new GLib.Bytes(new TextEncoder().encode([text, 'supertonic', '0', 'en'].join('\0'))))
+    const legacyPath = GLib.build_filenamev([cacheA, `${legacyKey}.wav`])
+    Gio.File.new_for_path(headerPath).copy(Gio.File.new_for_path(legacyPath),
+        Gio.FileCopyFlags.NONE, null, null)
+    const before = runCount()
+    const fresh = await tts.synth(text, supertonicPack, { lang: 'en' })
+    assert(runCount() === before + 1,
+        'old split-sentence cache entry must trigger fresh synthesis')
+    assert(fresh.wavPath !== legacyPath,
+        'fresh sentence audio must not reuse the legacy cache path')
+    assert(GLib.file_test(legacyPath, GLib.FileTest.IS_REGULAR),
+        'cache invalidation must leave old files untouched')
+    await tts.synth(text, supertonicPack, { lang: 'en' })
+    assert(runCount() === before + 1,
+        'fresh unsplit sentence audio is reused on the second call')
+}
+
 // default cache dir: <XDG_CACHE_HOME>/foliate/tts-wav. gjs warms
 // g_get_user_cache_dir() at process startup (its module bytecode cache),
 // so XDG_CACHE_HOME set via GLib.setenv after that cannot repoint it
@@ -292,7 +321,7 @@ const defaultWav = (await defaultTTS.synth('Hello world.', piperPack)).wavPath
 assert(defaultWav.startsWith(GLib.get_user_cache_dir()) &&
     defaultWav.includes('/foliate/tts-wav/'),
 `default cache dir is <XDG_CACHE_HOME>/foliate/tts-wav (got ${defaultWav})`)
-assert(runCount() === 5, 'piper synth ran the engine')
+assert(runCount() === 7, 'piper synth ran the engine')
 // the default-path probe wrote into the real user cache: remove it again
 Gio.File.new_for_path(defaultWav).delete(null)
 
@@ -485,7 +514,7 @@ try {
 }
 exit(0)
 `)
-{
+if (GLib.getenv('FOLIATE_VOICE_TEST_SMOKE') === '1') {
     const gjs = GLib.find_program_in_path('gjs') ?? 'gjs'
     GLib.unsetenv('FOLIATE_TTS_CMD')
     GLib.setenv('XDG_DATA_HOME', realDataHome, true)
@@ -526,7 +555,7 @@ exit(0)
                 .delete(null)
         } catch { /* nothing to sweep */ }
     }
-}
+} else print('SKIPPED: real-engine smoke (set FOLIATE_VOICE_TEST_SMOKE=1)')
 
 // wait for the killed fake engines' SIGCHLD teardown before checking state
 await new Promise(resolve =>

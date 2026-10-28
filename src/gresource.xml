@@ -22,6 +22,9 @@
     <file>voice-packs.js</file>
     <file>tts-normalize.js</file>
     <file>voice-daemon.js</file>
+    <file>voice-daemon-gate.js</file>
+    <file>voice-pack-validation.js</file>
+    <file>voice-pack-jobs.js</file>
     <file>voice-manager.js</file>
     <file>webview.js</file>
     <file>ui/annotation-popover.ui</file>

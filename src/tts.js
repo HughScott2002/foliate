@@ -6,7 +6,7 @@ import * as utils from './utils.js'
 import { SSIPClient } from './speech.js'
 import { LocalTTS } from './local-tts.js'
 import { LocalTTSPlayer, SECTION_END } from './local-tts-player.js'
-import { getInstalledPacks } from './voice-packs.js'
+import { getInstalledPacks, resolveNarratorSid } from './voice-packs.js'
 import { getVoiceDaemon } from './voice-daemon.js'
 import { normalizeText, setNormalizeBackend } from './tts-normalize.js'
 
@@ -47,14 +47,21 @@ export const TTSBox = GObject.registerClass({
     #generation = 0
     #settings = utils.settings('viewer')
     #backend = this.#settings?.get_string('tts-backend') ?? 'local'
-    #tts = new LocalTTS()
-    #player = new LocalTTSPlayer({ tts: this.#tts })
+    #tts
+    #player
+    #daemonRunning
+    #supertonicSid = resolveNarratorSid().sid
     #warmed = new Set()
     language = 'en'
     pack = null
     defaultWidget = this._play_button
-    constructor(params) {
+    constructor({ tts, player, daemonRunning, ...params } = {}) {
         super(params)
+        // test seams: inject the engine, the player, and the daemon probe;
+        // production defaults are unchanged
+        this.#tts = tts ?? new LocalTTS()
+        this.#player = player ?? new LocalTTSPlayer({ tts: this.#tts })
+        this.#daemonRunning = daemonRunning ?? (() => getVoiceDaemon().running)
         this.insert_action_group('tts', utils.addMethods(this, {
             actions: ['play', 'backward', 'forward', 'stop'],
         }))
@@ -94,6 +101,13 @@ export const TTSBox = GObject.registerClass({
         this.pack = pack
         this._voice_label.label = pack?.label ?? _('Download a voice to get started')
     }
+    // Book-level Supertonic narrator: the effective SID for warm-up and
+    // playback. Changing it never stops an active run; the new value
+    // applies to the next start. Must not touch Kokoro's or Piper's SID:
+    // only Supertonic consults this value.
+    setSupertonicSid(sid) {
+        this.#supertonicSid = resolveNarratorSid({ stored: sid }).sid
+    }
     // Warm the chosen pack in the background: synthesize a short sample so
     // the daemon lazy-loads the model while the reader is still finding
     // their place, instead of paying the model load on first Play. One
@@ -102,17 +116,28 @@ export const TTSBox = GObject.registerClass({
         const pack = this.pack
         if (this.backend !== 'local' || !pack) return
         if (!getInstalledPacks().some(x => x.id === pack.id)) return
-        if (this.#warmed.has(pack.id)) return
+        // Key primers by the effective Supertonic narrator too: a book-level
+        // narrator change must re-warm, not stay suppressed by the old
+        // pack-id-only gate. Other engines key by pack only, so a narrator
+        // change never re-warms them.
+        const warmedKey = `${pack.id}:` +
+            (pack.id === 'supertonic' ? this.#supertonicSid : '')
+        if (this.#warmed.has(warmedKey)) return
         // Only the daemon keeps a model loaded; if it is not up yet, skip —
         // otherwise this primer would fall back to the one-shot CLI engine
         // and occupy its single-process slot, making the first Play collide
         // with "a synthesis is already in progress". First Play then just
         // pays the model load.
-        if (!getVoiceDaemon().running) return
-        this.#warmed.add(pack.id)
+        if (!this.#daemonRunning()) return
+        this.#warmed.add(warmedKey)
         const lang = (this.language || 'en').split('-')[0]
         try {
-            await this.#tts.synth(pack.sample, pack, { lang })
+            await this.#tts.synth(pack.sample, pack, {
+                lang,
+                // only Supertonic takes the book-level narrator; other
+                // engines keep their own pack SID
+                ...(pack.id === 'supertonic' ? { sid: this.#supertonicSid } : {}),
+            })
         } catch (e) {
             // a warm-up is best effort; first Play just pays the load instead
             console.debug(`tts warm-up skipped: ${e.message}`)
@@ -276,6 +301,10 @@ export const TTSBox = GObject.registerClass({
         await this.#player.playStream(source, {
             pack: this.pack,
             rate: this._local_rate.value,
+            // the book-level narrator applies only to Supertonic; other
+            // engines use their own pack SID
+            ...(this.pack.id === 'supertonic'
+                ? { voice: this.#supertonicSid } : {}),
             onSectionEnd: async () => {
                 const advanced = await this.emit('next-section')
                 return generation === this.#generation && advanced

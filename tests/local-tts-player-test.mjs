@@ -559,6 +559,27 @@ const start = ({ hold = false, failTexts, gate } = {}) => {
         `${JSON.stringify(tts.calls.map(c => c.sid))})`)
 }
 
+// --- stopAndWait awaits the run's teardown ---
+
+{
+    const { tts, sessions, ends, errors, player, run } = start()
+    const done = run(2)
+    assert(await waitFor(() => sessions.length === 1),
+        'the stopAndWait run reached its first session')
+    let settled = false
+    const waiting = player.stopAndWait().then(() => { settled = true })
+    assert(await waitFor(() => settled),
+        'stopAndWait resolves after the run unwinds')
+    await settle(done)
+    assert(ends.length === 1 && ends[0] === null,
+        `stopAndWait ended the run as a stop (got: ${JSON.stringify(ends)})`)
+    assert(errors.length === 0, 'stopAndWait is not an error')
+    assert(tts.stopAllCount >= 1,
+        `stopAndWait awaited stopAll teardown (calls: ${tts.stopAllCount})`)
+    await waiting
+    await player.stopAndWait() // nothing playing: resolves immediately
+}
+
 if (failures) {
     printerr(`${failures} test${failures > 1 ? 's' : ''} failed`)
     exit(1)

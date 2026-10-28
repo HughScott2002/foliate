@@ -16,4 +16,5 @@ shell:
 	nix-shell
 
 test:
-	nix-shell --run 'for test in tests/*-test.mjs; do GTK_A11Y=none GSETTINGS_BACKEND=memory gjs -m "$$test" || exit; done'
+	FOLIATE_TEST_SCHEMA_XML=data/com.github.johnfactotum.Foliate.gschema.xml \
+		nix-shell --run 'sh tests/run-isolated-tests.sh tests/*-test.mjs'

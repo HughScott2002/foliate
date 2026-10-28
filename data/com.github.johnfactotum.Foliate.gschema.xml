@@ -51,6 +51,10 @@
     <key name="tts-read-footnotes" type="b">
       <default>false</default>
     </key>
+    <key name="tts-supertonic-sid" type="u">
+      <range min="0" max="9"/>
+      <default>0</default>
+    </key>
     <child schema="com.github.johnfactotum.Foliate.viewer.view" name="view"/>
     <child schema="com.github.johnfactotum.Foliate.viewer.font" name="font"/>
     <key name="fold-sidebar" type="b">

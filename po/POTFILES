@@ -10,6 +10,7 @@ src/selection-tools.js
 src/themes.js
 src/tts.js
 src/utils.js
+src/voice-packs.js
 src/ui/annotation-popover.ui
 src/ui/annotation-row.ui
 src/ui/book-image.ui
