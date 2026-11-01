@@ -2,6 +2,8 @@ import { makeBook, NotFoundError, UnsupportedTypeError } from '../foliate-js/vie
 import { Overlayer } from '../foliate-js/overlayer.js'
 import { parseSSML, NarrationHighlight, highlightTarget } from './tts.js'
 import { FootnoteHandler } from '../foliate-js/footnotes.js'
+import { TTS } from '../foliate-js/tts.js'
+import { textWalker } from '../foliate-js/text-walker.js'
 import { toPangoMarkup } from './markup.js'
 
 const format = {}
@@ -295,6 +297,7 @@ class Reader {
     // consumed by ttsStart after initTTS has run (so the block snapshot is
     // taken after the map is cleared, not before)
     #pendingRange = null
+    #preparedTTS = null
     // whether footnotes/endnotes are read (the "read notes" preference),
     // carried across section changes so a boundary never resets it
     readNotes = false
@@ -306,6 +309,7 @@ class Reader {
         this.readNotes = readNotes
         this.#rangeMap.clear()
         this.#blockSeq = -1
+        this.#preparedTTS = null
         // local: capture each block's ranges on demand (applied in ttsSetMark)
         // speechd: keep the default scroll-to-anchor highlight callback
         await this.view.initTTS(local ? 'sentence' : 'word', local
@@ -314,17 +318,17 @@ class Reader {
     }
     // Advance the iterator (next/prev/start/from a range), then snapshot the
     // highlight range of every sentence in the fetched block.
-    #fetchBlock(mode, range) {
-        const ssml = mode === 'prev' ? this.view.tts.prev()
+    #fetchBlock(mode, range, tts = this.view.tts) {
+        const ssml = mode === 'prev' ? tts.prev()
             : mode === 'start'
-                ? (range ? this.view.tts.from(range) : this.view.tts.start())
-                : this.view.tts.next()
+                ? (range ? tts.from(range) : tts.start())
+                : tts.next()
         if (!ssml) return null
         const seq = ++this.#blockSeq
         const marks = new Map()
         for (const s of parseSSML(ssml).sentences) {
             this.#capturedRange = null
-            this.view.tts.setMark(s.index)
+            tts.setMark(s.index)
             if (this.#capturedRange) marks.set(String(s.index), this.#capturedRange)
         }
         this.#rangeMap.set(seq, marks)
@@ -363,6 +367,32 @@ class Reader {
         }
         this.view.tts.setMark(mark)
     }
+    async ttsPrepareNextSection() {
+        if (!this.localNarration) return null
+        const renderer = this.view.renderer
+        if (typeof renderer.getPreparedContents !== 'function') return null
+        const index = renderer.getContents()[0]?.index
+        if (index == null) return null
+        const next = this.book.sections.findIndex((section, i) =>
+            i > index && section.linear !== 'no')
+        if (next < 0) return null
+        // Lookahead must not hold up the audio already being played if a
+        // neighboring frame is still loading.
+        const doc = renderer.getPreparedContents(next)
+        if (!doc || renderer.getContents()[0]?.index !== index) return null
+        const tts = new TTS(doc, textWalker,
+            range => { this.#capturedRange = range }, 'sentence',
+            { readNotes: this.readNotes })
+        this.#preparedTTS = { index: next, tts }
+        let block = this.#fetchBlock('start', null, tts)
+        // A chapter may begin with skipped notes or other silent blocks.
+        // Find its first speakable sentence while the current audio plays.
+        for (let n = 0; n < 64 && block
+            && !parseSSML(block.ssml).sentences.length; n++)
+            block = this.#fetchBlock('next', null, tts)
+        if (!block) this.#preparedTTS = null
+        return block
+    }
     async ttsNextSection() {
         const index = this.view.renderer.getContents()[0]?.index
         if (index == null) return false
@@ -382,6 +412,13 @@ class Reader {
             await new Promise(resolve => setTimeout(resolve, 25))
         }
         if (this.view.renderer.getContents()[0]?.index !== next) return false
+        const prepared = this.#preparedTTS
+        if (prepared?.index === next
+            && prepared.tts.doc === this.view.renderer.getContents()[0].doc) {
+            this.view.tts = prepared.tts
+            this.#preparedTTS = null
+            return true
+        }
         await this.initTTS({ local: this.localNarration, readNotes: this.readNotes })
         return true
     }

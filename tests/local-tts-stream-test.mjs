@@ -73,7 +73,16 @@ const makeHarness = ({ blocks, sectioned = false }) => {
         if (si >= blocks[bi].sentences.length) { si = 0; bi++; broke = false }
         return { text, index: text, lang: 'en' }
     }
-    return { events, tts, playWav, source, synths, plays }
+    const prepareNext = () => {
+        const block = blocks[bi]
+        if (!block) return []
+        events.push(['prepare', block.id])
+        bi++
+        si = 0
+        broke = false
+        return block.sentences.map(text => ({ text, index: text, lang: 'en' }))
+    }
+    return { events, tts, playWav, source, prepareNext, synths, plays }
 }
 
 // Model the real timing: synthesis is far faster than playback, so every
@@ -301,6 +310,36 @@ const assertPrefetched = (events, order) => {
     const played = h.events.filter(e => e[0] === 'play-end').map(e => e[1])
     assert(JSON.stringify(played) === JSON.stringify(['p1', 'p2', 'p3', 'q1', 'q2']),
         `playback order wrong across a boundary: ${played}`)
+}
+
+// --- case 11: the next chapter's audio can be synthesized ahead without
+// moving the visible page until playback reaches the boundary ---
+{
+    const h = makeHarness({
+        blocks: [
+            { id: 'a', sentences: ['a1', 'a2'] },
+            { id: 'b', sentences: ['b1', 'b2'] },
+        ],
+        sectioned: true,
+    })
+    const crossed = []
+    const player = new LocalTTSPlayer({ tts: h.tts, playWav: h.playWav })
+    const run = player.playStream(h.source, {
+        pack: {}, synthAhead: 4,
+        onSectionPrepare: h.prepareNext,
+        onSectionEnd: async () => { crossed.push(h.events.length); return true },
+    })
+    await drive(h, 4)
+    await run
+    const synthB = h.events.findIndex(e => e[0] === 'synth-start' && e[1] === 'b1')
+    const lastA = h.events.findIndex(e => e[0] === 'play-end' && e[1] === 'a2')
+    assert(synthB !== -1 && synthB < lastA,
+        'next chapter audio was not synthesized before current chapter ended')
+    assert(crossed.length === 1 && crossed[0] > lastA,
+        'visible chapter changed during audio lookahead')
+    const played = h.events.filter(e => e[0] === 'play-start').map(e => e[1])
+    assert(JSON.stringify(played) === JSON.stringify(['a1', 'a2', 'b1', 'b2']),
+        `prepared chapter audio order or count wrong: ${played}`)
 }
 
 if (failures) {

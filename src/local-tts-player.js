@@ -309,7 +309,8 @@ export class LocalTTSPlayer {
     // released once its audio has played); every loop iteration either
     // plays one sentence, crosses one boundary, or ends the stream.
     async playStream(source, {
-        pack, voice, rate, synthAhead, onMark, onSectionEnd, onEnd, onError,
+        pack, voice, rate, synthAhead, onMark, onSectionPrepare,
+        onSectionEnd, onEnd, onError,
     } = {}) {
         invariant(typeof source === 'function', 'source must be a function')
         while (this.#run) {
@@ -347,6 +348,7 @@ export class LocalTTSPlayer {
         // by fill (never past the window) and resolved only when playback
         // reaches it: lookahead may discover a boundary but never crosses it.
         let pendingSection = -1
+        let preparedSection = []
         // consecutive boundary crossings that produced no sentence (empty
         // sections, e.g. image-only pages); bounded so a pathological book
         // cannot spin the loop
@@ -385,11 +387,13 @@ export class LocalTTSPlayer {
         const fill = async target => {
             invariant(target >= 0, 'fill target is non-negative')
             invariant(entries.size <= this.#synthAhead, 'window not exceeded before fill')
-            // a known boundary blocks all further fetching until playback
-            // reaches it and onSectionEnd pages the renderer
-            if (pendingSection !== -1) return
+            // Prepared sentences may be synthesized before the boundary,
+            // but no further source blocks are fetched until the page turns.
+            if (pendingSection !== -1 && !preparedSection.length) return
             while (!run.dead && !sourceDone && scheduled < target) {
-                const s = await source()
+                if (pendingSection !== -1 && !preparedSection.length) return
+                const s = preparedSection.length
+                    ? preparedSection.shift() : await source()
                 if (run.dead) return
                 if (s === SECTION_END) {
                     // hold at the boundary: the next sentence lives in the
@@ -397,7 +401,16 @@ export class LocalTTSPlayer {
                     // already scheduled has played
                     if (!onSectionEnd) { sourceDone = true; return }
                     pendingSection = scheduled + 1
-                    return
+                    if (onSectionPrepare) {
+                        preparedSection = await onSectionPrepare() ?? []
+                        if (run.dead) return
+                        invariant(Array.isArray(preparedSection),
+                            'prepared section is an array of sentences')
+                        invariant(preparedSection.length <= AHEAD_MAX,
+                            'prepared section stays within the audio window')
+                    }
+                    if (!preparedSection.length) return
+                    continue
                 }
                 if (!s) { sourceDone = true; return }
                 invariant(typeof s.text === 'string', 'source sentence has text')
@@ -418,8 +431,7 @@ export class LocalTTSPlayer {
                 if (run.dead) break
                 if (pendingSection === i) {
                     // playback has reached the boundary: now page the
-                    // renderer, then keep pulling from the new section
-                    invariant(!entries.has(i), 'a section boundary has no sentence')
+                    // renderer; its first audio may already be synthesized
                     pendingSection = -1
                     blankAdvances += 1
                     if (blankAdvances > 64) { sourceDone = true; break }

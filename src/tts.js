@@ -28,6 +28,7 @@ export const TTSBox = GObject.registerClass({
             return_type: GObject.TYPE_JSOBJECT,
         },
         'next-section': { return_type: GObject.TYPE_JSOBJECT },
+        'prepare-next-section': { return_type: GObject.TYPE_JSOBJECT },
         'parse': {
             param_types: [GObject.TYPE_STRING],
             return_type: GObject.TYPE_JSOBJECT,
@@ -270,13 +271,17 @@ export const TTSBox = GObject.registerClass({
     // its own block's ranges even though lookahead has advanced the iterator.
     async #speakStream(initial, generation) {
         const buffer = []
-        const addBlock = async blk => {
+        const parseBlock = async blk => {
             const parsed = await this.emit('parse', blk.ssml)
-            if (generation !== this.#generation) return false
+            if (generation !== this.#generation) return null
             const lang = (parsed.language || this.language).split('-')[0]
-            for (const s of parsed.sentences)
-                buffer.push({ text: normalizeText(s.text, lang),
-                    index: s.index, lang, seq: blk.seq })
+            return parsed.sentences.map(s => ({ text: normalizeText(s.text, lang),
+                index: s.index, lang, seq: blk.seq }))
+        }
+        const addBlock = async blk => {
+            const sentences = await parseBlock(blk)
+            if (!sentences) return false
+            buffer.push(...sentences)
             return true
         }
         if (initial) {
@@ -305,6 +310,14 @@ export const TTSBox = GObject.registerClass({
             // engines use their own pack SID
             ...(this.pack.id === 'supertonic'
                 ? { voice: this.#supertonicSid } : {}),
+            onSectionPrepare: async () => {
+                const blk = await this.emit('prepare-next-section')
+                if (generation !== this.#generation || !blk) return []
+                const sentences = await parseBlock(blk) ?? []
+                const ahead = this.#player.synthAhead
+                buffer.push(...sentences.slice(ahead))
+                return sentences.slice(0, ahead)
+            },
             onSectionEnd: async () => {
                 const advanced = await this.emit('next-section')
                 return generation === this.#generation && advanced

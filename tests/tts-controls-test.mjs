@@ -92,6 +92,7 @@ const fakePlayer = () => {
     const streams = []
     return {
         streams,
+        synthAhead: 4,
         playStream: async (_source, options) => {
             streams.push(options)
         },
@@ -137,15 +138,21 @@ installPack(supertonic)
     box.setSupertonicSid(9)
     box.connect('init', () => ({}))
     box.connect('start', () => ({ ssml: '<s>Sentence</s>', seq: 0 }))
-    box.connect('parse', () => ({
-        language: 'en', sentences: [{ text: 'Sentence', index: 0 }],
+    box.connect('parse', (_, ssml) => ({
+        language: 'en', sentences: ssml.includes('Next chapter')
+            ? Array.from({ length: 6 }, (_, index) =>
+                ({ text: `Next ${index}`, index }))
+            : [{ text: 'Sentence', index: 0 }],
     }))
     box.connect('forward', () => null)
+    box.connect('prepare-next-section', () => ({
+        ssml: '<s>Next chapter.</s>', seq: 2,
+    }))
     // playStream pending so the run stays active while the SID changes
     let releaseStream
     const gate = new Promise(resolve => { releaseStream = resolve })
     player.playStream = (_source, options) => {
-        player.streams.push(options)
+        player.streams.push({ ...options, source: _source })
         return gate
     }
     const run = box.start()
@@ -153,6 +160,15 @@ installPack(supertonic)
     check(player.streams.length === 1, 'start did not hand the source to playStream')
     check(player.streams[0].voice === 9,
         `Supertonic run must pass voice 9, got ${player.streams[0].voice}`)
+    check((await player.streams[0].source()).text === 'Sentence',
+        'current narration sentence was not pulled first')
+    const prepared = await player.streams[0].onSectionPrepare()
+    check(prepared.length === 4 && prepared.every(x => x.seq === 2)
+        && prepared[0].text === 'Next 0' && prepared[3].text === 'Next 3',
+    'local stream did not bound the prepared chapter audio window')
+    check((await player.streams[0].source()).text === 'Next 4'
+        && (await player.streams[0].source()).text === 'Next 5',
+    'prepared chapter sentences beyond the audio window were lost')
     // the new SID applies only to the next start: the run is untouched
     check(box.state === 'playing', 'run must be playing before the SID change')
     box.setSupertonicSid(2)

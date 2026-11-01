@@ -436,6 +436,7 @@ GObject.registerClass({
     ttsParse(x) { return this.#exec('reader.ttsParse', x) }
     ttsClear() { return this.#exec('reader.ttsClear') }
     ttsNextSection() { return this.#exec('reader.ttsNextSection') }
+    ttsPrepareNextSection() { return this.#exec('reader.ttsPrepareNextSection') }
     mediaOverlayStart() { return this.#exec('reader.view.startMediaOverlay') }
     mediaOverlayPause() { return this.#exec('reader.view.mediaOverlay.pause') }
     mediaOverlayResume() { return this.#exec('reader.view.mediaOverlay.resume') }
@@ -761,6 +762,7 @@ export const BookViewer = GObject.registerClass({
             'parse': (_, ssml) => this._view.ttsParse(ssml),
             'clear-highlight': () => this._view.ttsClear().catch(e => console.debug(e)),
             'next-section': () => this._view.ttsNextSection(),
+            'prepare-next-section': () => this._view.ttsPrepareNextSection(),
             'voices-requested': (_, startAfterSelection) => this.#showVoices(startAfterSelection),
         })
         utils.connect(this._navbar.media_overlay_box, {
