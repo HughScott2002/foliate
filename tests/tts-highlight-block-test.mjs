@@ -99,6 +99,17 @@ try {
             + JSON.stringify(captured?.toString()))
     check(parseSSML(t.next()).sentences[0]?.text === 'Epsilon zeta.',
         'narration after the clipped sentence did not reach the next block')
+    const partial = document.createRange()
+    partial.setStart(firstText, 8) // "ta" inside "beta"
+    partial.setEnd(firstText, 10)
+    const partialSpoken = parseSSML(t.from(partial)).sentences
+    check(partialSpoken[0]?.text === 'beta.',
+        'a partial-word selection must begin at the whole word: '
+            + JSON.stringify(partialSpoken))
+    captured = null
+    t.setMark(partialSpoken[0].index)
+    check(captured?.toString().trim() === 'beta.',
+        'partial-word highlight must include the whole word')
     const inline = document.createElement('p')
     inline.innerHTML = 'Before <em>chosen</em> word continues. Another sentence.'
     document.body.append(inline)
@@ -114,6 +125,21 @@ try {
     inlineTTS.setMark(inlineSpoken[0].index)
     check(captured?.toString().trim() === 'chosen word continues.',
         'inline selection highlight did not begin at the chosen word')
+    selectedInline.setStart(inline.querySelector('em').firstChild, 3)
+    const partialInline = parseSSML(inlineTTS.from(selectedInline)).sentences
+    check(partialInline[0]?.text === 'chosen word continues.',
+        'partial word inside inline markup did not snap to the word start')
+    const phrase = document.createElement('p')
+    phrase.textContent = 'These programs are the answer.'
+    document.body.append(phrase)
+    const phraseText = phrase.firstChild
+    const phraseSelection = document.createRange()
+    phraseSelection.setStart(phraseText, phraseText.textContent.indexOf('grams'))
+    phraseSelection.setEnd(phraseText, phraseText.textContent.indexOf('the answer'))
+    const phraseTTS = new TTS(document, textWalker, () => {}, 'sentence')
+    check(parseSSML(phraseTTS.from(phraseSelection)).sentences[0]?.text
+        === 'programs are the answer.',
+    'selecting "grams are" must begin at "programs"')
     window.webkit.messageHandlers.result.postMessage(JSON.stringify({
         passed: true, message: 'Highlight block-snapshot (lookahead safe) tests passed',
     }))
