@@ -166,7 +166,12 @@ await web.exec('reader.ttsSetMark', { seq: preparedAudio.seq, mark: firstMark })
 check(await web.eval(`reader.view.renderer.getContents()[0].doc.defaultView
     .CSS.highlights.has('foliate-narration')`),
     'prepared chapter audio did not highlight the visible text')
+const pausedPage = await viewer._view.ttsVisiblePosition()
 await viewer._view.prevSection()
+const browsedPage = await viewer._view.ttsVisiblePosition()
+check(browsedPage.navigation > pausedPage.navigation
+    && browsedPage.cfi !== pausedPage.cfi,
+    'narration controls could not detect a manual page change')
 check(await web.eval('reader.view.renderer.getContents()[0].index') === 0,
     'manual navigation did not leave the spoken chapter')
 await web.exec('reader.ttsSetMark', { seq: preparedAudio.seq, mark: firstMark })

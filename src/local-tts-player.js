@@ -127,6 +127,7 @@ export class LocalTTSPlayer {
     #run = null
     #rate = 1
     #paused = false
+    #resumeWaiters = []
 
     constructor({ tts, playWav, synthAhead = AHEAD_DEFAULT, log } = {}) {
         if (!tts)
@@ -144,6 +145,13 @@ export class LocalTTSPlayer {
     // Current synth-ahead window (sentences beyond the playing one), and the
     // measured real-time factor of the last sentence (for diagnostics).
     get synthAhead() { return this.#synthAhead }
+    async #waitWhilePaused(run) {
+        while (this.#paused && !run.dead)
+            await new Promise(resolve => this.#resumeWaiters.push(resolve))
+    }
+    #wakePaused() {
+        for (const resolve of this.#resumeWaiters.splice(0)) resolve()
+    }
 
     // Fold one sentence's timing into the window and emit the debug line the
     // flow is audited with: rtf < 1 means the next sentence will be ready.
@@ -426,6 +434,8 @@ export class LocalTTSPlayer {
         try {
             let i = 0
             while (!run.dead) {
+                await this.#waitWhilePaused(run)
+                if (run.dead) break
                 invariant(i >= 0, 'playback index non-negative')
                 await fill(i + this.#synthAhead - 1)
                 if (run.dead) break
@@ -457,6 +467,8 @@ export class LocalTTSPlayer {
                     run.dead = true
                     throw error
                 }
+                await this.#waitWhilePaused(run)
+                if (run.dead) break
                 onMark?.(pending.get(i) ?? { index: i })
                 if (run.dead) break
                 const session = await this.#makeSession(result.wavPath, {
@@ -514,6 +526,7 @@ export class LocalTTSPlayer {
 
     resume() {
         this.#paused = false
+        this.#wakePaused()
         this.#run?.session?.resume?.()
     }
 
@@ -530,6 +543,7 @@ export class LocalTTSPlayer {
         const run = this.#run
         if (!run || run.dead) return
         run.dead = true
+        this.#wakePaused()
         run.session?.stop?.()
         run.cancellable.cancel()
         // not awaited here — the unwinding play() awaits its own

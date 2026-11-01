@@ -385,6 +385,26 @@ const start = ({ hold = false, failTexts, gate } = {}) => {
         'playback finished after resume')
 }
 
+// --- a sentence ending during Pause does not end the held stream ---
+
+{
+    const { sessions, ends, player } = start()
+    let next = 0
+    const done = player.playStream(async () => sentencesOf(1)[next++] ?? null, {
+        pack: PACK, onEnd: value => ends.push(value),
+    })
+    assert(await waitFor(() => sessions.length === 1),
+        'playback started before the pause-at-boundary test')
+    player.pause()
+    sessions[0].release() // model an end-of-stream already queued at Pause
+    await tick(50)
+    assert(ends.length === 0,
+        'a paused stream must not finish and reset Play at sentence end')
+    player.resume()
+    await settle(done)
+    assert(ends.length === 1, 'the held stream finishes after Resume')
+}
+
 // --- a pause with nothing playing does not turn the next run silent ---
 
 {
