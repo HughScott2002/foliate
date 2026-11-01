@@ -1,7 +1,7 @@
 # Dev helpers: run Foliate from source on NixOS.
 # See https://github.com/johnfactotum/foliate#run-without-building-or-installing
 
-SCHEMA_DIR := $(CURDIR)/_build/dev-schemas
+SCHEMA_DIR := $(CURDIR)/target
 
 .PHONY: run shell test
 
