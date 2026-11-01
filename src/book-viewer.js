@@ -175,6 +175,7 @@ GObject.registerClass({
         'dialog-open': { param_types: [GObject.TYPE_JSOBJECT] },
         'dialog-close': { param_types: [GObject.TYPE_JSOBJECT] },
         'relocate': { param_types: [GObject.TYPE_JSOBJECT] },
+        'narration-position': { param_types: [GObject.TYPE_JSOBJECT] },
         'external-link': { param_types: [GObject.TYPE_JSOBJECT] },
         'selection': { param_types: [GObject.TYPE_JSOBJECT] },
         'create-overlay': { param_types: [GObject.TYPE_JSOBJECT] },
@@ -437,6 +438,7 @@ GObject.registerClass({
     ttsClear() { return this.#exec('reader.ttsClear') }
     ttsNextSection() { return this.#exec('reader.ttsNextSection') }
     ttsPrepareNextSection() { return this.#exec('reader.ttsPrepareNextSection') }
+    ttsReturnToNarration() { return this.#exec('reader.ttsReturnToNarration') }
     mediaOverlayStart() { return this.#exec('reader.view.startMediaOverlay') }
     mediaOverlayPause() { return this.#exec('reader.view.mediaOverlay.pause') }
     mediaOverlayResume() { return this.#exec('reader.view.mediaOverlay.resume') }
@@ -567,6 +569,7 @@ export const BookViewer = GObject.registerClass({
             'book-error': (_, x) => this.#onError(x),
             'book-ready': (_, x) => this.#onBookReady(x).catch(e => console.error(e)),
             'relocate': (_, x) => this.#onRelocate(x),
+            'narration-position': (_, x) => this._navbar.setNarrationCanReturn(x.canReturn),
             'external-link': (_, x) => new Gtk.UriLauncher({ uri: x.href }).launch(this.root, null, null),
             'selection': (_, x) => this.#onSelection(x),
             'create-overlay': (_, x) => this.#createOverlay(x),
@@ -765,6 +768,8 @@ export const BookViewer = GObject.registerClass({
             'prepare-next-section': () => this._view.ttsPrepareNextSection(),
             'voices-requested': (_, startAfterSelection) => this.#showVoices(startAfterSelection),
         })
+        this._navbar.connect('return-to-narration', () =>
+            this._view.ttsReturnToNarration())
         utils.connect(this._navbar.media_overlay_box, {
             'start': () => this._view.mediaOverlayStart(),
             'pause': () => this._view.mediaOverlayPause(),

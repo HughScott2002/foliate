@@ -131,7 +131,7 @@ GObject.registerClass({
         'loc-entry', 'loc-total', 'cfi-entry',
         'section-entry', 'section-total', 'section-buttons',
         'location-popover-stack', 'landmark-view', 'landmark-toggle',
-        'narration-controls', 'narration-play', 'narration-stop',
+        'narration-controls', 'narration-play', 'narration-stop', 'narration-return',
         'narration-rate',
     ],
     Signals: {
@@ -140,6 +140,7 @@ GObject.registerClass({
         'go-to-fraction': { param_types: [GObject.TYPE_DOUBLE] },
         'opened': {},
         'closed': {},
+        'return-to-narration': {},
     },
 }, class extends Gtk.Box {
     #locationTotal
@@ -155,6 +156,7 @@ GObject.registerClass({
             box.connect('state-changed', () => this.#syncNarration())
         this._narration_play.connect('clicked', () => this.#narration.play())
         this._narration_stop.connect('clicked', () => this.#narration.stop())
+        this._narration_return.connect('clicked', () => this.emit('return-to-narration'))
         this._narration_rate.adjustment = this.tts_box.rateAdjustment
         this._loc_entry.connect('activate', entry => {
             this.emit('go-to-fraction', parseInt(entry.text) / this.#locationTotal)
@@ -193,6 +195,7 @@ GObject.registerClass({
     #syncNarration() {
         const state = this.#narration.state
         this._narration_controls.visible = state !== 'stopped'
+        if (state === 'stopped') this._narration_return.visible = false
         this._narration_play.icon_name = state === 'playing'
             ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic'
         this._narration_play.tooltip_text = state === 'playing'
@@ -200,6 +203,12 @@ GObject.registerClass({
         this._narration_rate.visible = this.#narration === this.tts_box
             && this.tts_box.backend === 'local'
         this.emit(state === 'stopped' ? 'closed' : 'opened')
+    }
+    setNarrationCanReturn(canReturn) {
+        this._narration_return.visible = canReturn
+            && this.#narration === this.tts_box
+            && this.tts_box.backend === 'local'
+            && this.tts_box.state !== 'stopped'
     }
     update(progress) {
         const { fraction, section, location, time, cfi, pageItem } = progress

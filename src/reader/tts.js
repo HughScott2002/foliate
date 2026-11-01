@@ -40,7 +40,7 @@ export class NarrationHighlight {
             const style = doc.createElement('style')
             style.dataset.foliateNarration = ''
             style.textContent = `::highlight(foliate-narration) {
-                background-color: #f6d32d; color: #241f31;
+                background-color: color-mix(in srgb, currentColor 18%, transparent);
             }`
             doc.head.append(style)
         }

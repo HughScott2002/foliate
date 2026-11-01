@@ -57,6 +57,7 @@ app.connectOpen(app, [Gio.File.new_for_path(file)])
 const win = app.active_window
 const viewer = [...descendants(win)].find(w => w instanceof BookViewer)
 if (!viewer) throw new Error('viewer missing')
+const nav = viewer._navbar
 const web = viewer._view.webView
 await until(async () => (await web.eval('globalThis.reader?.view?.lastLocation?.section?.current ?? null')) === 0, 'first chapter missing')
 web.zoom_level = 2
@@ -140,6 +141,7 @@ await until(async () => await web.eval(
     '!!reader.view.renderer.getPreparedContents?.(1)'),
     'next chapter was not prepared after the reverse turn')
 await web.exec('reader.initTTS', { local: true })
+nav.tts_box.state = 'playing'
 check((await web.exec('reader.ttsStart'))?.ssml,
     'current chapter did not produce narration text')
 let exhausted = false
@@ -164,5 +166,33 @@ await web.exec('reader.ttsSetMark', { seq: preparedAudio.seq, mark: firstMark })
 check(await web.eval(`reader.view.renderer.getContents()[0].doc.defaultView
     .CSS.highlights.has('foliate-narration')`),
     'prepared chapter audio did not highlight the visible text')
+await viewer._view.prevSection()
+check(await web.eval('reader.view.renderer.getContents()[0].index') === 0,
+    'manual navigation did not leave the spoken chapter')
+await web.exec('reader.ttsSetMark', { seq: preparedAudio.seq, mark: firstMark })
+check(await web.eval('reader.view.renderer.getContents()[0].index') === 0,
+    'spoken mark pulled the reader away from the browsed page')
+check(nav._narration_return.visible, 'Return to narration was not offered')
+await web.exec('reader.ttsReturnToNarration')
+check(await web.eval('reader.view.renderer.getContents()[0].index') === 1,
+    'Return to narration did not find the spoken chapter')
+check(!nav._narration_return.visible, 'Return to narration stayed visible')
+await viewer._view.prevSection()
+for (let n = 0; n < 10; n++)
+    if (!await web.exec('reader.ttsNext')) break
+const nextAudio = await web.exec('reader.ttsPrepareNextSection')
+check(nextAudio?.ssml, 'audio lookahead followed the browsed chapter')
+check(await web.exec('reader.ttsNextSection'),
+    'audio did not advance while browsing another chapter')
+check(await web.eval('reader.view.renderer.getContents()[0].index') === 0,
+    'audio chapter advance moved the browsed page')
+await web.exec('reader.ttsSetMark', {
+    seq: nextAudio.seq,
+    mark: (await web.exec('reader.ttsParse', nextAudio.ssml)).sentences[0].index,
+})
+await web.exec('reader.ttsReturnToNarration')
+check(await web.eval('reader.view.renderer.getContents()[0].index') === 2,
+    'Return to narration lost the new spoken chapter')
+nav.tts_box.stop()
 win.close()
-print('Zoomed chapter turns and prepared narration remain in sync')
+print('Zoomed chapter turns, independent narration and Return remain in sync')

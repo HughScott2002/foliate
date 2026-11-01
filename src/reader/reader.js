@@ -286,7 +286,7 @@ class Reader {
         this.sectionFractions = this.view.getSectionFractions()
     }
     narrationHighlight = new NarrationHighlight()
-    // Highlight ranges snapshotted per fetched block (seq -> mark -> Range).
+    // Highlight ranges snapshotted per fetched block (seq -> section + marks).
     // Lookahead advances the iterator past the sentence being read, which
     // overwrites foliate-js's internal mark map; snapshotting at fetch time
     // keeps highlighting a sentence independent of where the iterator is.
@@ -298,6 +298,10 @@ class Reader {
     // taken after the map is cleared, not before)
     #pendingRange = null
     #preparedTTS = null
+    #audioIndex = null
+    #spokenCFI = null
+    #followingNarration = true
+    #narrationNavigating = 0
     // whether footnotes/endnotes are read (the "read notes" preference),
     // carried across section changes so a boundary never resets it
     readNotes = false
@@ -310,6 +314,11 @@ class Reader {
         this.#rangeMap.clear()
         this.#blockSeq = -1
         this.#preparedTTS = null
+        this.#audioIndex = this.view.renderer.getContents()[0]?.index ?? null
+        this.#spokenCFI = null
+        this.#followingNarration = true
+        this.view.renderer.releaseNarrationContents?.()
+        emit({ type: 'narration-position', canReturn: false })
         // local: capture each block's ranges on demand (applied in ttsSetMark)
         // speechd: keep the default scroll-to-anchor highlight callback
         await this.view.initTTS(local ? 'sentence' : 'word', local
@@ -318,7 +327,7 @@ class Reader {
     }
     // Advance the iterator (next/prev/start/from a range), then snapshot the
     // highlight range of every sentence in the fetched block.
-    #fetchBlock(mode, range, tts = this.view.tts) {
+    #fetchBlock(mode, range, tts = this.view.tts, index = this.#audioIndex) {
         const ssml = mode === 'prev' ? tts.prev()
             : mode === 'start'
                 ? (range ? tts.from(range) : tts.start())
@@ -331,12 +340,12 @@ class Reader {
             tts.setMark(s.index)
             if (this.#capturedRange) marks.set(String(s.index), this.#capturedRange)
         }
-        this.#rangeMap.set(seq, marks)
+        this.#rangeMap.set(seq, { index, marks })
         // keep only recent snapshots: a sentence's seq is fetched at most a
         // window ahead of playback, so a strictly older snapshot has already
         // played and is never needed again (bounds the map for long sections)
         for (const key of this.#rangeMap.keys())
-            if (key <= seq - 32) this.#rangeMap.delete(key)
+            if (key <= seq - 128) this.#rangeMap.delete(key)
         return { ssml, seq }
     }
     ttsStart() {
@@ -352,16 +361,65 @@ class Reader {
         return this.localNarration ? this.#fetchBlock('prev') : this.view.tts.prev(paused)
     }
     ttsParse(ssml) { return parseSSML(ssml) }
-    ttsClear() { this.narrationHighlight.clear() }
+    ttsClear() {
+        this.narrationHighlight.clear()
+        this.#rangeMap.clear()
+        this.#spokenCFI = null
+        this.#preparedTTS = null
+        this.view.renderer.releaseNarrationContents?.()
+        emit({ type: 'narration-position', canReturn: false })
+    }
+    #showSpokenPosition() {
+        if (!this.#spokenCFI || !this.#followingNarration) return
+        const { index, doc } = this.view.renderer.getContents()[0] ?? {}
+        if (index !== this.#audioIndex) return
+        try {
+            const range = this.view.resolveCFI(this.#spokenCFI).anchor(doc)
+            if (range) this.narrationHighlight.show(range)
+        } catch (e) { console.warn(e) }
+    }
+    async ttsReturnToNarration() {
+        if (!this.#spokenCFI) return
+        this.#narrationNavigating++
+        try {
+            // The spoken sentence may change while a chapter is loading.
+            // Follow the latest mark, without seeking or restarting audio.
+            for (let n = 0; n < 3; n++) {
+                const cfi = this.#spokenCFI
+                if (!cfi) return
+                await this.view.goTo(cfi)
+                if (cfi !== this.#spokenCFI) continue
+                if (this.view.renderer.getContents()[0]?.index
+                    !== this.view.resolveCFI(cfi).index) continue
+                this.#followingNarration = true
+                this.#showSpokenPosition()
+                emit({ type: 'narration-position', canReturn: false })
+                return
+            }
+        } finally { this.#narrationNavigating-- }
+    }
     // local passes {seq, mark} (resolved from the snapshot); speech-dispatcher
     // passes {mark} (no seq) and is resolved by foliate-js's own callback
-    ttsSetMark(x) {
+    async ttsSetMark(x) {
         const { mark, seq } = highlightTarget(x)
         if (seq != null) {
-            const range = this.#rangeMap.get(seq)?.get(String(mark))
+            const { index, marks } = this.#rangeMap.get(seq) ?? {}
+            const range = marks?.get(String(mark))
             if (range) {
-                this.view.renderer.scrollToAnchor(range, true)
-                this.narrationHighlight.show(range)
+                this.#audioIndex = index
+                this.#spokenCFI = this.view.getCFI(index, range)
+                if (this.#followingNarration) {
+                    const visible = this.view.renderer.getContents()[0]
+                    if (visible?.index === index) {
+                        const visibleRange = visible.doc === range.startContainer.ownerDocument
+                            ? range : this.view.resolveCFI(this.#spokenCFI).anchor(visible.doc)
+                        this.#narrationNavigating++
+                        try {
+                            await this.view.renderer.scrollToAnchor(visibleRange, true)
+                            this.narrationHighlight.show(visibleRange)
+                        } finally { this.#narrationNavigating-- }
+                    }
+                } else emit({ type: 'narration-position', canReturn: true })
             }
             return
         }
@@ -370,56 +428,60 @@ class Reader {
     async ttsPrepareNextSection() {
         if (!this.localNarration) return null
         const renderer = this.view.renderer
-        if (typeof renderer.getPreparedContents !== 'function') return null
-        const index = renderer.getContents()[0]?.index
+        const index = this.#audioIndex
         if (index == null) return null
         const next = this.book.sections.findIndex((section, i) =>
             i > index && section.linear !== 'no')
         if (next < 0) return null
         // Lookahead must not hold up the audio already being played if a
         // neighboring frame is still loading.
-        const doc = renderer.getPreparedContents(next)
-        if (!doc || renderer.getContents()[0]?.index !== index) return null
+        const doc = await renderer.prepareNarrationContents(next)
+        if (!doc || this.#audioIndex !== index) return null
         const tts = new TTS(doc, textWalker,
             range => { this.#capturedRange = range }, 'sentence',
             { readNotes: this.readNotes })
         this.#preparedTTS = { index: next, tts }
-        let block = this.#fetchBlock('start', null, tts)
+        let block = this.#fetchBlock('start', null, tts, next)
         // A chapter may begin with skipped notes or other silent blocks.
         // Find its first speakable sentence while the current audio plays.
         for (let n = 0; n < 64 && block
             && !parseSSML(block.ssml).sentences.length; n++)
-            block = this.#fetchBlock('next', null, tts)
+            block = this.#fetchBlock('next', null, tts, next)
         if (!block) this.#preparedTTS = null
         return block
     }
     async ttsNextSection() {
-        const index = this.view.renderer.getContents()[0]?.index
+        const index = this.#audioIndex
         if (index == null) return false
         const next = this.book.sections.findIndex((section, i) =>
             i > index && section.linear !== 'no')
         if (next < 0) return false
-        this.ttsClear()
-        // goTo can be dropped while the renderer is busy (#locked) and can
-        // resolve before the new section's document is the visible one;
-        // initTTS reads that document, so a half-applied section change
-        // would leave the TTS iterator pointing at the old section and the
-        // stream would stall at the boundary. Retry until the renderer
-        // actually reports the new index (bounded), then re-init.
-        for (let n = 0; n < 40; n++) {
-            await this.view.renderer.goTo({ index: next })
-            if (this.view.renderer.getContents()[0]?.index === next) break
-            await new Promise(resolve => setTimeout(resolve, 25))
-        }
-        if (this.view.renderer.getContents()[0]?.index !== next) return false
+        const renderer = this.view.renderer
         const prepared = this.#preparedTTS
-        if (prepared?.index === next
-            && prepared.tts.doc === this.view.renderer.getContents()[0].doc) {
-            this.view.tts = prepared.tts
-            this.#preparedTTS = null
-            return true
+        const doc = prepared?.index === next ? prepared.tts.doc
+            : await renderer.prepareNarrationContents(next)
+        if (!doc) return false
+        this.#audioIndex = next
+        this.view.tts = prepared?.index === next ? prepared.tts
+            : new TTS(doc, textWalker,
+                range => { this.#capturedRange = range }, 'sentence',
+                { readNotes: this.readNotes })
+        this.#preparedTTS = null
+        if (this.#followingNarration) {
+            this.#narrationNavigating++
+            try {
+                // The visible page follows audio only while the reader has
+                // not turned pages to browse independently.
+                for (let n = 0; n < 40; n++) {
+                    await renderer.goTo({ index: next })
+                    if (renderer.getContents()[0]?.index === next) break
+                    await new Promise(resolve => setTimeout(resolve, 25))
+                }
+            } finally { this.#narrationNavigating-- }
+            if (renderer.getContents()[0]?.index !== next)
+                this.#followingNarration = false
         }
-        await this.initTTS({ local: this.localNarration, readNotes: this.readNotes })
+        renderer.releaseNarrationContents()
         return true
     }
     setAppearance({ style, layout, autohideCursor }) {
@@ -447,6 +509,14 @@ class Reader {
     }
     #handleEvents() {
         this.view.addEventListener('relocate', e => {
+            if (this.localNarration && this.#spokenCFI
+                && !this.#narrationNavigating
+                && ['page', 'scroll', 'snap', 'navigation', 'selection']
+                    .includes(e.detail.reason)) {
+                this.#followingNarration = false
+                this.narrationHighlight.clear()
+                emit({ type: 'narration-position', canReturn: true })
+            }
             const { heads, feet } = this.view.renderer
             if (heads) {
                 const { tocItem } = e.detail

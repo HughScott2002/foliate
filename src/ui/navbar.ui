@@ -101,6 +101,13 @@
         </object>
       </child>
       <child>
+        <object class="GtkButton" id="narration-return">
+          <property name="visible">False</property>
+          <property name="icon-name">go-jump-symbolic</property>
+          <property name="tooltip-text" translatable="yes">Return to narration</property>
+        </object>
+      </child>
+      <child>
         <object class="GtkSpinButton" id="narration-rate">
           <property name="digits">2</property>
           <property name="numeric">True</property>
