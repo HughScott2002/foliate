@@ -805,24 +805,28 @@ export const Library = GObject.registerClass({
             'unapply': () => this._split_view.collapsed = false,
         }))
 
-        this._sidebar_list_box.set_header_func((row, before) => {
-            if (!before)
-                row.set_header(utils.addClass(new Gtk.Label({
-                    label: _('Library'),
-                    xalign: 0,
-                    margin_start: 12,
-                    margin_bottom: 6,
-                }), 'caption-heading', 'dim-label'))
-            if (before && before.child.item.type !== 'catalog'
-            && row.child.item.type === 'catalog')
-                row.set_header(utils.addClass(new Gtk.Label({
-                    label: _('Catalogs'),
-                    xalign: 0,
-                    margin_start: 12,
-                    margin_top: 18,
-                    margin_bottom: 6,
-                }), 'caption-heading', 'dim-label'))
-        })
+        const updateHeaders = () => {
+            let previous
+            for (let i = 0; i < sidebarListModel.get_n_items(); i++) {
+                const row = this._sidebar_list_box.get_row_at_index(i)
+                const item = sidebarListModel.get_item(i)
+                if (!row) {
+                    previous = item
+                    continue
+                }
+                row.set_header(i === 0 || item.type === 'catalog'
+                    && previous?.type !== 'catalog'
+                    ? utils.addClass(new Gtk.Label({
+                        label: i === 0 ? _('Library') : _('Catalogs'),
+                        xalign: 0,
+                        margin_start: 12,
+                        margin_top: i === 0 ? 0 : 18,
+                        margin_bottom: 6,
+                    }), 'caption-heading', 'dim-label')
+                    : null)
+                previous = item
+            }
+        }
         this._sidebar_list_box.add_controller(utils.connect(Gtk.DropTarget.new(
             SidebarItem.$gtype, Gdk.DragAction.MOVE), {
             'motion': (_, _x, y) => {
@@ -883,6 +887,9 @@ export const Library = GObject.registerClass({
             return new Gtk.ListBoxRow({ child,
                 selectable: item.value !== 'add-catalog' })
         })
+        const headerHandler = sidebarListModel.connect('items-changed', updateHeaders)
+        this.connect('destroy', () => sidebarListModel.disconnect(headerHandler))
+        updateHeaders()
         this._sidebar_list_box.connect('row-activated', (__, row) => {
             const { type, value } = row.child.item
             if (value === 'add-catalog') return this.addCatalog().catch(e => console.error(e))

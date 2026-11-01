@@ -25,6 +25,7 @@ pkg.modulepath = path => `${root}/src/${path}`
 pkg.moduleuri = path => Gio.File.new_for_path(pkg.modulepath(path)).get_uri()
 const { Application } = await import(Gio.File.new_for_path(`${root}/src/app.js`).get_uri())
 const { BookViewer } = await import(Gio.File.new_for_path(`${root}/src/book-viewer.js`).get_uri())
+const { Library } = await import(Gio.File.new_for_path(`${root}/src/library.js`).get_uri())
 const delay = ms => new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms,
     () => (resolve(), GLib.SOURCE_REMOVE)))
 const until = async (predicate, message) => {
@@ -202,6 +203,9 @@ await web.run(`reader.view.init({ lastLocation: ${JSON.stringify(staleLocation)}
 await until(async () => await web.eval('reader.view.lastLocation?.section?.current') === 0,
     'an invalid saved position did not recover to its chapter')
 win.showLibrary()
+const library = [...descendants(win)].find(w => w instanceof Library)
+check(library?._sidebar_list_box.get_row_at_index(0)?.get_header()?.label === 'Library',
+    'library sidebar heading is missing')
 win.openFile(Gio.File.new_for_path(file))
 win.showLibrary()
 win.close()
