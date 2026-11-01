@@ -302,7 +302,6 @@ class Reader {
     #spokenCFI = null
     #followingNarration = true
     #narrationNavigating = 0
-    #manualNavigation = 0
     // whether footnotes/endnotes are read (the "read notes" preference),
     // carried across section changes so a boundary never resets it
     readNotes = false
@@ -362,13 +361,6 @@ class Reader {
         return this.localNarration ? this.#fetchBlock('prev') : this.view.tts.prev(paused)
     }
     ttsParse(ssml) { return parseSSML(ssml) }
-    ttsVisiblePosition() {
-        return {
-            cfi: this.view.lastLocation?.cfi ?? null,
-            navigation: this.#manualNavigation,
-            following: this.#followingNarration,
-        }
-    }
     ttsClear() {
         this.narrationHighlight.clear()
         this.#rangeMap.clear()
@@ -517,15 +509,13 @@ class Reader {
     }
     #handleEvents() {
         this.view.addEventListener('relocate', e => {
-            if (!this.#narrationNavigating
+            if (this.localNarration && this.#spokenCFI
+                && !this.#narrationNavigating
                 && ['page', 'scroll', 'snap', 'navigation', 'selection']
                     .includes(e.detail.reason)) {
-                this.#manualNavigation++
-                if (this.localNarration && this.#spokenCFI) {
-                    this.#followingNarration = false
-                    this.narrationHighlight.clear()
-                    emit({ type: 'narration-position', canReturn: true })
-                }
+                this.#followingNarration = false
+                this.narrationHighlight.clear()
+                emit({ type: 'narration-position', canReturn: true })
             }
             const { heads, feet } = this.view.renderer
             if (heads) {

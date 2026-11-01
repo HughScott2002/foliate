@@ -85,6 +85,35 @@ try {
         'block two, mark 0 must be in block two')
     check(snapshots[1].get('1').toString().startsWith('Eta'),
         'block two mark 1 text wrong: ' + snapshots[1].get('1').toString())
+    const selected = document.createRange()
+    const firstText = document.querySelector('#one').firstChild
+    selected.setStart(firstText, 6) // "beta" in "Alpha beta."
+    selected.setEnd(firstText, 10)
+    const spoken = parseSSML(t.from(selected)).sentences
+    check(spoken[0]?.text === 'beta.' && spoken[1]?.text === 'Gamma delta.',
+        'Speak from here skipped the selected word: ' + JSON.stringify(spoken))
+    captured = null
+    t.setMark(spoken[0].index)
+    check(captured?.toString().trim() === 'beta.',
+        'first spoken highlight did not start at the selected word: '
+            + JSON.stringify(captured?.toString()))
+    check(parseSSML(t.next()).sentences[0]?.text === 'Epsilon zeta.',
+        'narration after the clipped sentence did not reach the next block')
+    const inline = document.createElement('p')
+    inline.innerHTML = 'Before <em>chosen</em> word continues. Another sentence.'
+    document.body.append(inline)
+    const selectedInline = document.createRange()
+    selectedInline.selectNodeContents(inline.querySelector('em'))
+    const inlineTTS = new TTS(document, textWalker,
+        range => { captured = range }, 'sentence')
+    const inlineSpoken = parseSSML(inlineTTS.from(selectedInline)).sentences
+    check(inlineSpoken[0]?.text === 'chosen word continues.',
+        'Speak from here lost a selected word inside inline markup: '
+            + JSON.stringify(inlineSpoken))
+    captured = null
+    inlineTTS.setMark(inlineSpoken[0].index)
+    check(captured?.toString().trim() === 'chosen word continues.',
+        'inline selection highlight did not begin at the chosen word')
     window.webkit.messageHandlers.result.postMessage(JSON.stringify({
         passed: true, message: 'Highlight block-snapshot (lookahead safe) tests passed',
     }))

@@ -108,13 +108,12 @@ const waitMicro = ms => new Promise(resolve =>
         () => (resolve(), GLib.SOURCE_REMOVE)))
 installPack(supertonic)
 
-// Play resumes a paused stream on the same page; moving the visible page
-// makes Play stop that stream and start at the new reader position.
+// Pause/Play leaves the audio cursor alone even if the reader browses away;
+// Stop/Play and an explicit Speak from here start a fresh stream.
 {
     const player = fakePlayer()
     const releases = []
     let stops = 0, resumes = 0, inits = 0
-    let position = { cfi: 'page-one', navigation: 0, following: true }
     player.playStream = (_source, options) => {
         player.streams.push(options)
         return new Promise(resolve => releases.push(resolve))
@@ -127,7 +126,6 @@ installPack(supertonic)
     box.connect('start', () => ({ ssml: '<s>Sentence</s>', seq: 0 }))
     box.connect('parse', () => ({ language: 'en',
         sentences: [{ text: 'Sentence', index: 0 }] }))
-    box.connect('position', () => position)
     const run = box.start()
     await waitMicro(20)
     const stopsBeforePause = stops
@@ -136,18 +134,18 @@ installPack(supertonic)
     check(resumes === 1 && inits === 1 && stops === stopsBeforePause,
         'Play on the same page must resume the existing sentence stream')
     box.pause()
-    position = { cfi: 'page-two', navigation: 1, following: false }
     await box.start()
+    check(resumes === 2 && inits === 1 && stops === stopsBeforePause,
+        'Play after browsing must resume the old audio cursor')
+    box.stop()
+    box.start()
     await waitMicro(20)
-    check(resumes === 1 && inits === 2 && stops === stopsBeforePause + 1
-        && player.streams.length === 2,
-    'Play on a new page must replace the paused stream')
-    position = { cfi: 'page-three', navigation: 2, following: false }
-    box.pause() // browsing happened while the second stream was playing
-    await box.start()
+    check(inits === 2 && player.streams.length === 2,
+        'Stop then Play must start from the visible reader position')
+    box.speak({})
     await waitMicro(20)
     check(inits === 3 && player.streams.length === 3,
-        'Play on a browsed page must start there even when Pause came later')
+        'Speak from here must replace the current audio stream')
     box.stop()
     for (const release of releases) release()
     await run

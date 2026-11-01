@@ -433,7 +433,6 @@ GObject.registerClass({
     ttsPrev(x) { return this.#exec('reader.ttsPrev', x) }
     ttsNext(x) { return this.#exec('reader.ttsNext', x) }
     ttsResume() { return this.#exec('reader.view.tts.resume') }
-    ttsVisiblePosition() { return this.#exec('reader.ttsVisiblePosition') }
     ttsSetMark(x) { return this.#exec('reader.ttsSetMark', x) }
     ttsParse(x) { return this.#exec('reader.ttsParse', x) }
     ttsClear() { return this.#exec('reader.ttsClear') }
@@ -758,7 +757,6 @@ export const BookViewer = GObject.registerClass({
             }),
             'start': () => this._view.ttsStart(),
             'resume': () => this._view.ttsResume(),
-            'position': () => this._view.ttsVisiblePosition(),
             'backward': () => this._view.ttsPrev(),
             'forward': () => this._view.ttsNext(),
             'backward-paused': () => this._view.ttsPrev(true),

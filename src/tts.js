@@ -19,7 +19,6 @@ export const TTSBox = GObject.registerClass({
         'init': { return_type: GObject.TYPE_JSOBJECT },
         'start': { return_type: GObject.TYPE_JSOBJECT },
         'resume': { return_type: GObject.TYPE_JSOBJECT },
-        'position': { return_type: GObject.TYPE_JSOBJECT },
         'backward': { return_type: GObject.TYPE_JSOBJECT },
         'forward': { return_type: GObject.TYPE_JSOBJECT },
         'backward-paused': {},
@@ -47,8 +46,6 @@ export const TTSBox = GObject.registerClass({
 }, class extends Gtk.Box {
     #state = 'stopped'
     #generation = 0
-    #pausedPosition = null
-    #resumePending = null
     #settings = utils.settings('viewer')
     #backend = this.#settings?.get_string('tts-backend') ?? 'local'
     #tts
@@ -195,8 +192,11 @@ export const TTSBox = GObject.registerClass({
     }
     start() {
         if (this.backend === 'local') {
-            if (this.state === 'paused') return this.#resumePending ??=
-                this.#resumeLocal().finally(() => this.#resumePending = null)
+            if (this.state === 'paused') {
+                this.#player.resume()
+                this.state = 'playing'
+                return
+            }
             return this.#beginLocal('start')
         }
         this.#init()
@@ -207,31 +207,11 @@ export const TTSBox = GObject.registerClass({
     }
     pause() {
         this.state = 'paused'
-        if (this.backend === 'local') {
-            this.#player.pause()
-            this.#pausedPosition = Promise.resolve(this.emit('position'))
-            return
-        }
+        if (this.backend === 'local') return this.#player.pause()
         ssip.stop().catch(e => this.error(e))
-    }
-    async #resumeLocal() {
-        const paused = await this.#pausedPosition
-        const current = await this.emit('position')
-        if (this.state !== 'paused') return
-        this.#pausedPosition = null
-        if (current?.following === false
-            || (paused?.navigation !== current?.navigation
-                && paused?.cfi && current?.cfi && paused.cfi !== current.cfi)) {
-            // Play on another page explicitly moves the audio cursor there.
-            this.#beginLocal('start')
-            return
-        }
-        this.#player.resume()
-        this.state = 'playing'
     }
     stop() {
         ++this.#generation
-        this.#pausedPosition = null
         this.#player.stop()
         this.state = 'stopped'
         this.emit('clear-highlight')
@@ -266,7 +246,6 @@ export const TTSBox = GObject.registerClass({
             return
         }
         const generation = ++this.#generation
-        this.#pausedPosition = null
         this.#player.stop()
         this.state = 'playing'
         try {
