@@ -21,7 +21,7 @@ let
 in pkgs.mkShell {
   packages = with pkgs; [
     sherpa gjs gobject-introspection gtk4 libadwaita webkitgtk_6_0
-    libsoup_3 glib python3 gnutar bzip2
+    libsoup_3 tinysparql glib python3 gnutar bzip2
     gst_all_1.gstreamer gst_all_1.gst-plugins-base
     gst_all_1.gst-plugins-good gst_all_1.gst-plugins-bad
   ];
