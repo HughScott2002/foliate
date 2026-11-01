@@ -58,19 +58,6 @@ GSETTINGS_SCHEMA_DIR=data gjs -m src/main.js
 
 ### Building and Installing from Source
 
-#### NixOS development
-
-With the `foliate-js` submodule initialized, run `make run` (or
-`make run ARGS=/path/to/book.epub`). The dev shell supplies GTK/WebKit,
-GStreamer, and a pinned sherpa-onnx runtime; voice models are downloaded
-from the Narration menu. `make test` runs the test suites on an existing display.
-
-Other source builds need `libsoup-3.0`, GStreamer Play (including the
-GstPlay typelib, WAV decoding and an audio-output plugin), `tar`, `bzip2`,
-and `sherpa-onnx-offline-tts` 1.13.8 on `PATH` for local narration.
-`FOLIATE_TTS_CMD` can point to that executable. Version 2.0 removes the
-built-in Piper phonemizer and is not compatible with this integration.
-
 The following dependencies are required for building:
 
 - `meson` (>= 0.59)
