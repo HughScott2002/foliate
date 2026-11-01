@@ -152,7 +152,7 @@ GObject.registerClass({
     }
     update(location = this.#location) {
         this.#location = location
-        if (!this.model) return
+        if (!this.model || !location) return
         const { cfi } = location
         const start = CFI.collapse(cfi)
         const end = CFI.collapse(cfi, true)
@@ -338,6 +338,7 @@ GObject.registerClass({
         return this.#scrollToIndex(this.#filter.get_n_items() - 1)
     }
     update(location) {
+        if (!location) return
         if (!this.#filter) {
             this.#location = location
             return
@@ -347,7 +348,7 @@ GObject.registerClass({
             this.#location = location
             return
         }
-        if (this.#location.cfi === location.cfi) return
+        if (this.#location?.cfi === location.cfi) return
         this.scrollToCFI(location.cfi)
         this.#location = location
     }

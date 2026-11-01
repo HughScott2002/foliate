@@ -562,6 +562,7 @@ export const BookViewer = GObject.registerClass({
     #book
     #cover
     #data
+    #unrooted = false
     #voiceManager
     constructor(params) {
         super(params)
@@ -871,6 +872,7 @@ export const BookViewer = GObject.registerClass({
         this._navbar.setTTSType(book.media?.duration ? 'media-overlay' : 'tts')
 
         const cover = await this._view.getCover()
+        if (this.#unrooted) return
         this.#cover = cover
         if (cover) {
             this._book_cover.set_from_pixbuf(cover)
@@ -882,7 +884,19 @@ export const BookViewer = GObject.registerClass({
         book.metadata.identifier ||= makeIdentifier(this.#file)
         const { identifier } = book.metadata
         if (identifier) {
-            this.#data = await dataStore.get(identifier, this._view)
+            let data
+            try {
+                data = await dataStore.get(identifier, this._view)
+            } catch (e) {
+                if (!this.#unrooted) throw e
+                dataStore.delete(this._view)
+                return
+            }
+            if (this.#unrooted) {
+                dataStore.delete(this._view)
+                return
+            }
+            this.#data = data
             const { annotations, bookmarks } = this.#data
             this._annotation_view.setupModel(annotations)
             this._bookmark_view.setupModel(bookmarks)
@@ -1192,13 +1206,16 @@ export const BookViewer = GObject.registerClass({
         dialog.present(this.root)
     }
     vfunc_unroot() {
+        this.#unrooted = true
         this.#voiceManager?.close()
         this._navbar.tts_box.kill()
         this._view.viewSettings.unbindSettings()
         this._view.fontSettings.unbindSettings()
         this._view.narrationSettings.unbindSettings()
-        utils.disconnectWith(this, this.#data.annotations)
-        utils.disconnectWith(this, this.#data.bookmarks)
+        if (this.#data) {
+            utils.disconnectWith(this, this.#data.annotations)
+            utils.disconnectWith(this, this.#data.bookmarks)
+        }
         dataStore.delete(this._view)
 
         // it seems that it's necessary to explicitly destroy web view

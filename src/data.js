@@ -124,7 +124,9 @@ class BookDataStore {
     delete(view) {
         const key = this.#keys.get(view)
         const views = this.#views.get(key)
+        if (!views) return
         views.delete(view)
+        this.#keys.delete(view)
         if (!views.size) {
             this.#map.delete(key)
             this.#views.delete(key)

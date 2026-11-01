@@ -194,5 +194,15 @@ await web.exec('reader.ttsReturnToNarration')
 check(await web.eval('reader.view.renderer.getContents()[0].index') === 2,
     'Return to narration lost the new spoken chapter')
 nav.tts_box.stop()
+const staleLocation = await web.eval(`(() => {
+    const cfi = reader.book.sections[0].cfi
+    return cfi.slice(0, -1) + '!/999:0)'
+})()`)
+await web.run(`reader.view.init({ lastLocation: ${JSON.stringify(staleLocation)} })`)
+await until(async () => await web.eval('reader.view.lastLocation?.section?.current') === 0,
+    'an invalid saved position did not recover to its chapter')
+win.showLibrary()
+win.openFile(Gio.File.new_for_path(file))
+win.showLibrary()
 win.close()
-print('Zoomed chapter turns, independent narration and Return remain in sync')
+print('Zoomed chapter turns, narration, stale positions and viewer cleanup remain in sync')
